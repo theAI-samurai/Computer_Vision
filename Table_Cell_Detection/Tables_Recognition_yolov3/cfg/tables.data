@@ -1,0 +1,6 @@
+classes= 3
+train  = cfg/train.txt
+valid  = cfg/test.txt
+names = cfg/tables.names
+backup = weight_tables
+#eval=coco
