@@ -492,27 +492,27 @@ class PyMuPdf:
                         df0.loc[j, 't_h'] = d_y2 - d_y
         return df0
 
-    def is_overlap_check_along_rows(self, ax1, ax2, aw, bx1, bx2, bw):
+    def is_overlap_check_along_rows(self, ax1, ax2, aw, bx1, bx2, bw, perc =0.07):
         '''
         This Function checks if there is an overlap between
         x - coordinates of cells of boxes, irrespective of the y- coordinate
         '''
         if aw < bw:
             if ((ax1 >= bx1) and (ax2 > bx1)) and ((ax1 < bx2) and (ax2 <= bx2)):
-                return True
+                return True, 1
         if bw < aw:
             if ((bx1 >= ax1) and (bx2 > ax1)) and ((bx1 < ax2) and (bx2 <= ax2)):
-                return True
+                return True, 1
         if ax1 <= bx1:
             if (bx1 >= ax1) and (bx2 > ax1) and (bx1 < ax2):  # ie bx1 lies between ax1 and ax2
                 per = (ax2 - bx1) / (ax2 - ax1)
-                if per > 0.07:
-                    return True
+                if per > perc:
+                    return True, per
         if bx1 <= ax1:
             if (ax1 >= bx1) and (ax2 > bx1) and (ax1 < bx2):  # ie bx1 lies between ax1 and ax2
                 per = (bx2 - ax1) / (bx2 - bx1)
-                if per > 0.07:
-                    return True
+                if per > perc:
+                    return True, per
 
     def isRectangleOverlap(self, R1, R2):
         '''
@@ -1015,7 +1015,7 @@ class PyMuPdf:
                         src_df.loc[src_ind, 'header'] = 1
         return src_df
 
-    def column_creation(self,  src_df, columdet):
+    def column_creation_v1(self,  src_df, columdet):
         header_flag = -1
         frame = src_df.loc[src_df['header'] == 1]
         # check to see if 'HEADER' is detected
@@ -1042,6 +1042,10 @@ class PyMuPdf:
 
             columdet.sort_values(['x', 'y'], inplace=True)
             zcol_det_df = columdet.reset_index(drop=True)
+
+            # this dict is used to populate the column index and percentage overlap between coordinates and column detection
+            ovelap_lst = {}
+
             # using metadata here
             for i in range(len(src_df)):
                 src_x = src_df.loc[i, 'x']
@@ -1053,6 +1057,22 @@ class PyMuPdf:
                     # check complete overlap
                     if src_x >= col_x and src_x2 <= col_x2 and src_df.loc[i, 'col'] == -1:
                         src_df.loc[i, 'col'] = jind
+                        break
+                    # check partial Overlap
+                    else:
+                        overlap = self.is_overlap_check_along_rows(ax1=col_x, ax2=col_x2, aw=col_x2 - col_x, bx1=src_x, bx2=src_x2, bw=src_x2 - src_x, perc=0.4)
+                        if overlap:
+                            boo, per = overlap
+                            if boo is True:
+                                ovelap_lst.update({jind: per})
+
+                # if there was a partial overlap, we need to find index of column having Maximum
+                # overlap with, hence following will run only if there was partial overlap
+                if len(ovelap_lst) > 0:
+                    keys = list(ovelap_lst.keys())  # in python 3, you'll need `list(i.keys())`
+                    values = list(ovelap_lst.values())
+                    max_overlap_was_with_col = keys[values.index(max(values))]
+                    src_df.loc[i, 'col'] = max_overlap_was_with_col
             frame = src_df.copy()
 
         # this code creates the ctr for unidentified words in header
@@ -1087,6 +1107,36 @@ class PyMuPdf:
         new = new.sort_values(by=[0])
         new = new.reset_index(drop=False)
 
+        columdet = columdet.sort_values(by=['x'])
+        columdet = columdet.reset_index(drop=False)
+        for len_ind in new.index:
+            index_val = new.loc[len_ind, 'index']
+            len_xmin = new.loc[len_ind, 0]
+            len_xmax = new.loc[len_ind, 1]
+
+            # getting values from col detection model
+            if index_val in list(columdet['index']):
+                det_xmin = columdet.loc[index_val, 'x']
+                det_xmax = columdet.loc[index_val, 'x2']
+
+                xmin = min(len_xmin, det_xmin)
+                xmax = max(len_xmax, det_xmax)
+
+                #
+                new.loc[len_ind, 0] = xmin
+                new.loc[len_ind, 1] = xmax
+                columdet.loc[index_val, 'x'] = xmin
+                columdet.loc[index_val, 'x2'] = xmax
+                columdet.loc[index_val, 'w'] = xmax - xmin
+            else:
+                xmin = len_xmin
+                xmax = len_xmax
+                columdet = columdet.append(
+                    {'index': index_val, 'x': xmin, 'y': 0, 'w': xmax - xmin, 'h': 0, 'x2': xmax, 'y2': 0,
+                     'name': 'column', 'conf': 1}, ignore_index=True)
+        columdet = columdet.sort_values(by=['x'])
+        columdet = columdet.reset_index(drop=True)
+
         lst = []
 
         for ind in new.index:
@@ -1108,7 +1158,206 @@ class PyMuPdf:
                 src_df.loc[index_val, 'col'] = colval
         new = new.drop('index', axis=1)
 
-        return src_df, new
+        return src_df, new, columdet
+
+    def column_creation_1(self,src_df, columdet):
+        header_flag = -1
+        frame = src_df.loc[src_df['header'] == 1]
+        # check to see if 'HEADER' is detected
+        if len(frame) > 0:  # HEADER is present in detection from Column model
+            header_flag = 1
+            frame.sort_values(['x'], inplace=True)
+            frame = frame.reset_index(drop=False)
+            for ind in frame.index:
+                hx1 = frame.loc[ind, 'x']
+                hx2 = frame.loc[ind, 'x'] + frame.loc[ind, 'w']
+                for indcol in columdet.index:
+                    name = columdet.loc[indcol, 'name']
+                    if name not in ['header']:
+                        colx1 = columdet.loc[indcol, 'x']
+                        colx2 = columdet.loc[indcol, 'x2']
+                        if hx1 >= colx1 and hx2 <= colx2 and frame.loc[ind, 'col'] == -1:
+                            frame.loc[ind, 'col'] = indcol
+                        else:
+                            if hx1 < colx1 and frame.loc[ind, 'col'] == -1:
+                                frame.loc[ind, 'col'] = -99
+        else:  # if ONLY Column was detected and no Header was found
+            src_df.sort_values(['x', 'y'], inplace=True)
+            src_df = src_df.reset_index(drop=True)
+
+            columdet.sort_values(['x', 'y'], inplace=True)
+            zcol_det_df = columdet.reset_index(drop=True)
+            # using metadata here
+            for i in range(len(src_df)):
+                src_x = src_df.loc[i, 'x']
+                src_x2 = src_x + src_df.loc[i, 'w']
+                ovelap_lst = {}
+                for jind in zcol_det_df.index:
+                    col_x = zcol_det_df.loc[jind, 'x']
+                    col_x2 = zcol_det_df.loc[jind, 'x2']
+
+                    # check complete overlap
+                    if src_x >= col_x and src_x2 <= col_x2 and src_df.loc[i, 'col'] == -1:
+                        src_df.loc[i, 'col'] = jind
+                        break
+                    # check partial Overlap
+                    else:
+                        overlap = self.is_overlap_check_along_rows(ax1=col_x, ax2=col_x2, aw=col_x2 - col_x, bx1=src_x,
+                                                              bx2=src_x2, bw=src_x2 - src_x, perc=0.4)
+                        if overlap:
+                            boo, per = overlap
+                            if boo is True:
+                                ovelap_lst.update({jind: per})
+                if len(ovelap_lst) > 0:
+                    keys = list(ovelap_lst.keys())  # in python 3, you'll need `list(i.keys())`
+                    values = list(ovelap_lst.values())
+                    max_overlap_was_with_col = keys[values.index(max(values))]
+                    src_df.loc[i, 'col'] = max_overlap_was_with_col
+            frame = src_df.copy()
+        return frame, header_flag
+
+    def column_creation_2(self,frame):
+        # this code creates the ctr for unidentified words in header
+        ctr = 10
+        for i in range(len(frame)):
+            val = frame.loc[i, 'col']
+            nextval = None
+            temp = []
+            if val < 0:
+                temp.append(i)
+                flag = -1
+                for j in range(i + 1, len(frame)):
+                    jval = frame.loc[j, 'col']
+                    if flag < 0 and jval < 0:
+                        temp.append(j)
+                    else:
+                        flag = 1
+                        nextval = frame.loc[j, 'col']
+                        break
+            for k in temp:
+                frame.loc[k, 'col'] = ctr
+            ctr = ctr + 1
+        return frame
+
+    def col_creation_3(self,frame):
+        dic = {}
+        unique_col = list(frame['col'].unique())
+        for e in unique_col:
+            temp_df = frame[frame['col'] == e]
+            dic.update({e: [min(temp_df['x']), max(temp_df['x'] + temp_df['w'])]})
+        new = pd.DataFrame.from_dict(dic)
+        new = new.transpose()
+        new = new.sort_values(by=[0])
+        new = new.reset_index(drop=False)
+        return new
+
+    def col_creation_4(self,col_length, col_det_df):
+        '''
+        this function takes as input
+        1. col_length_frame     : this is creteated using min of metadata cordinates and max of metadata
+        2. colDetection_frame   : this is the output of Column model
+        here we use the two information to adjust the satrt and end values of columns
+        '''
+        col_length = col_length.sort_values(by=[0])
+        col_length = col_length.reset_index(drop=True)
+
+        col_det_df = col_det_df.sort_values(by=['x'])
+        col_det_df = col_det_df.reset_index(drop=False)
+
+        # list of all index in Model Detection Frame
+        check_list = list(col_det_df['index'])
+
+        for len_ind in col_length.index:
+            index_val = col_length.loc[len_ind, 'index']
+            len_xmin = col_length.loc[len_ind, 0]
+            len_xmax = col_length.loc[len_ind, 1]
+
+            # getting values from col detection model
+            if index_val in list(col_det_df['index']):
+                det_xmin = col_det_df.loc[index_val, 'x']
+                det_xmax = col_det_df.loc[index_val, 'x2']
+
+                xmin = min(len_xmin, det_xmin)
+                xmax = max(len_xmax, det_xmax)
+
+                #
+                col_length.loc[len_ind, 0] = xmin
+                col_length.loc[len_ind, 1] = xmax
+                col_det_df.loc[index_val, 'x'] = xmin
+                col_det_df.loc[index_val, 'x2'] = xmax
+                col_det_df.loc[index_val, 'w'] = xmax - xmin
+
+                check_list.remove(index_val)
+
+            else:
+                xmin = len_xmin
+                xmax = len_xmax
+                col_det_df = col_det_df.append(
+                    {'index': index_val, 'x': xmin, 'y': 0, 'w': xmax - xmin, 'h': 0, 'x2': xmax, 'y2': 0,
+                     'name': 'column', 'conf': 1}, ignore_index=True)
+
+        if len(check_list) > 0:
+            for inde in col_det_df.index:
+                index_val = col_det_df.loc[inde, 'index']
+                if index_val in check_list:
+                    name = col_det_df.loc[inde, 'name']
+                    if name == 'header':
+                        check_list.remove(index_val)
+                    else:
+                        xmin = col_det_df.loc[inde, 'x']
+                        xmax = col_det_df.loc[inde, 'x2']
+                        col_length = col_length.append({'index': index_val, 0: xmin, 1: xmax}, ignore_index=True)
+
+        col_det_df = col_det_df.sort_values(by=['x'])
+        col_det_df = col_det_df.reset_index(drop=True)
+
+        col_length = col_length.sort_values(by=[0])
+        col_length = col_length.reset_index(drop=True)
+
+        return col_length, col_det_df
+
+    def col_creation_5(self, frame, new):
+        lst = []
+
+        for ind in new.index:
+            old_val = new.loc[ind, 'index']
+            new_val = ind
+            for k in range(len(frame)):
+                if frame.loc[k, 'col'] == old_val:
+                    lst.append(new_val)
+        frame['col'] = lst
+        return frame
+
+    def column_creation(self,src_df, coldetection):
+
+        # STEP 1. Source Dataframe and detetion of Column Model is used
+        # to create a frame where Column 'col' is populated based on
+        # a. Header is ther
+        # b. No Header was detected
+        frame, header_flag = self.column_creation_1(src_df, coldetection)
+
+        # STEP 2. if any column was not identified that is filled
+        frame = self.column_creation_2(frame)
+
+        # STEP 3: A Dataframe is created that has width of each column
+        new = self.col_creation_3(frame)
+
+        # STEP 4 . Information of Column detection using Model and new_frame in step 3
+        # is used to populate proper width of each col
+        new, coldetection = self.col_creation_4(new, coldetection)
+
+        # STEP 5 column value is corrected in header frame
+        frame = self.col_creation_5(frame, new)
+
+        if header_flag < 0:
+            src_df = frame.copy()
+        if header_flag > 0:
+            for i in range(len(frame)):
+                colval = frame.loc[i, 'col']
+                index_val = frame.loc[i, 'index']
+                src_df.loc[index_val, 'col'] = colval
+        new = new.drop('index', axis=1)
+        return src_df, new, coldetection
 
     def column_corr_final(self, src_df, col_range_frame):
         '''
@@ -1120,20 +1369,40 @@ class PyMuPdf:
         for ind in src_df.index:
             colvalue = src_df.loc[ind, 'col']
             if colvalue < 0:
-                cell_x1 = src_df.loc[ind, 'c_x']
-                cell_w = src_df.loc[ind, 'c_w']
-                cell_x2 = cell_x1 + cell_w
+                # using meta data
+                metacell_x1 = src_df.loc[ind, 'x']
+                metacell_w = src_df.loc[ind, 'w']
+                metacell_x2 = metacell_x1 + metacell_w
 
                 for detind in col_range_frame.index:
                     x1 = col_range_frame.loc[detind, 0]
                     x2 = col_range_frame.loc[detind, 1]
                     w = x2 - x1
 
-                    boo = self.is_overlap_check_along_rows(cell_x1, cell_x2, cell_w, x1, x2, w)
-                    # print((cell_x1, cell_x2, cell_w, x1, x2, w, boo, ind, detind))
-                    if boo:
-                        src_df.loc[ind, 'col'] = detind
-                        break
+                    booval = self.is_overlap_check_along_rows(metacell_x1, metacell_x2, metacell_w, x1, x2, w, perc=0.5)
+                    if booval:
+                        boo, per = booval
+                        if boo:
+                            src_df.loc[ind, 'col'] = detind
+                            break
+                    else:
+                        # Scenarios where metadata did not overlap
+                        # using cell value
+                        cell_x1 = src_df.loc[ind, 'c_x']
+                        cell_w = src_df.loc[ind, 'c_w']
+                        cell_x2 = cell_x1 + cell_w
+
+                        for detind in col_range_frame.index:
+                            x1 = col_range_frame.loc[detind, 0]
+                            x2 = col_range_frame.loc[detind, 1]
+                            w = x2 - x1
+
+                            booval = self.is_overlap_check_along_rows(cell_x1, cell_x2, cell_w, x1, x2, w, perc=0.5)
+                            if booval:
+                                boo, per = booval
+                                if boo:
+                                    src_df.loc[ind, 'col'] = detind
+                                    break
         return src_df
 
     def model_init(self, model_name, det):
@@ -1437,13 +1706,16 @@ class PyMuPdf:
             dataframe = dataframe.loc[(dataframe['is_in_cell'] == 1)]
             dataframe = dataframe.loc[(dataframe['is_in_table'] == 1)]
 
-            # STEP 2 : Lines sequence of words are corrected
-            dataframe = self.line_num_correction(src_df=dataframe)
+            # run if table was detected and above frame is not empty
+            if len(dataframe) > 0:
 
-            # STEP 3 : Word sequence horizontally are corrected
-            dataframe = self.word_num_corr(src_df=dataframe)
+                # STEP 2 : Lines sequence of words are corrected
+                dataframe = self.line_num_correction(src_df=dataframe)
 
-            try:
+                # STEP 3 : Word sequence horizontally are corrected
+                dataframe = self.word_num_corr(src_df=dataframe)
+
+                #try:
                 # step 4 : new column detection model
                 # a. Prediction by Column/ Header detection Model
                 column_detection = self.column_detection_intrim_pred(open_cv_image, dataframe, page_n=page_num)
@@ -1454,9 +1726,15 @@ class PyMuPdf:
                 dataframe = self.identify_headers(dataframe, column_detection)
 
                 # c. Column min_max_creation --> new_col_lengths
-                dataframe, new_col_lengths = self.column_creation(dataframe, column_detection)
+                dataframe, new_col_lengths, column_detection = self.column_creation(dataframe, column_detection)
                 dataframe = self.column_corr_final(dataframe, new_col_lengths)
                 dataframe['block_n'] = dataframe['col']
+
+                # deleting all texts where block value is still -1
+                # Get indexes where name column doesn't have value john
+                indexNames = dataframe[(dataframe['block_n'] == -1)].index
+                # Delete these row indexes from dataFrame
+                dataframe.drop(indexNames, inplace=True)
 
                 # STEP 4.a : Handling Multilines detected by model
                 orig_dataframe, dataframe = self.identify_cell_ids_with_multiline(src=dataframe)
@@ -1466,7 +1744,7 @@ class PyMuPdf:
                 # STEP 5 : Write result to EXCEL File
                 dataframe = dataframe.sort_values(['cell_id', 'c_x', 'c_y'])
                 dataframe.reset_index(drop=True, inplace=True)
-                self.test = dataframe.copy()
+                
                 # dataframe_write is dataframe which is near perfect excel format
                 dataframe_write = self.writing_formated_table_to_excel(src_frame=dataframe, save_path=self.result_dir + 'pdf_data_excel.xlsx', read_path=self.result_dir + 'pdf_data_excel.xlsx', page_no=page_num, save_excel=result_save)
                 # Handling Multiline with rules
@@ -1478,41 +1756,44 @@ class PyMuPdf:
                 # self.lookup_detections_df.to_json(self.result_dir + str(page_num) + '_detectionFrame.json')
                 dataframe_write['page_no'] = page_num
                 # dataframe_write.to_json(self.result_dir + str(page_num) + '_df_excelFrame.json')
-
-            except:
-                logger.info(' Inside Exception Entering to old method for block correction}')
-                logger.info(' for page number \t\t {}'.format(page_num))
-                logger.info(' for page number \t\t {}'.format(self.result_dir))
-                # STEP 4 : Column identification and correction of Block values / Column values
-                dataframe = self.block_corr_final(src_df=dataframe)
-                # STEP 4.a : Handling Multilines detected by model
-                orig_dataframe, dataframe = self.identify_cell_ids_with_multiline(src=dataframe)
-                # STEP 4.b : Handling Multiline part2
-                dataframe = self.multiline_correction_final(dataframe)
-
-                # STEP 5 : Write result to EXCEL File
-                dataframe = dataframe.sort_values(['cell_id', 'c_x', 'c_y'])
-                dataframe.reset_index(drop=True, inplace=True)
-                self.test = dataframe.copy()
-                # dataframe_write is dataframe which is near perfect excel format
-                dataframe_write = self.writing_formated_table_to_excel(src_frame=dataframe,
-                                                                       save_path=self.result_dir + 'pdf_data_excel.xlsx',
-                                                                       read_path=self.result_dir + 'pdf_data_excel.xlsx',
-                                                                       page_no=page_num, save_excel=result_save)
-                # Handling Multiline with rules
-                dataframe_write = self.handle_multiline_with_rule(df=dataframe_write)
-                # Writing this updated frame to excel again
-                self.write_excel_after_multiline_handling(src_frame=dataframe_write,
-                                                          save_path=self.result_dir + 'pdf_data_excel.xlsx',
-                                                          read_path=self.result_dir + 'pdf_data_excel.xlsx',
-                                                          page_no=page_num, save_excel=result_save)
-
-                # writing result to json file for testing
-                # self.lookup_detections_df.to_json(self.result_dir + str(page_num) + '_detectionFrame.json')
-                dataframe_write['page_no'] = page_num
-                # dataframe_write.to_json(self.result_dir + str(page_num) + '_df_excelFrame.json')
-
-            return pixel_dic, dataframe, dataframe_write, df_raw
+                """
+                except:
+                    logger.info(' Inside Exception Entering to old method for block correction}')
+                    logger.info(' for page number \t\t {}'.format(page_num))
+                    logger.info(' for page number \t\t {}'.format(self.result_dir))
+                    # STEP 4 : Column identification and correction of Block values / Column values
+                    dataframe = self.block_corr_final(src_df=dataframe)
+                    # STEP 4.a : Handling Multilines detected by model
+                    orig_dataframe, dataframe = self.identify_cell_ids_with_multiline(src=dataframe)
+                    # STEP 4.b : Handling Multiline part2
+                    dataframe = self.multiline_correction_final(dataframe)
+    
+                    # STEP 5 : Write result to EXCEL File
+                    dataframe = dataframe.sort_values(['cell_id', 'c_x', 'c_y'])
+                    dataframe.reset_index(drop=True, inplace=True)
+                    self.test = dataframe.copy()
+                    # dataframe_write is dataframe which is near perfect excel format
+                    dataframe_write = self.writing_formated_table_to_excel(src_frame=dataframe,
+                                                                           save_path=self.result_dir + 'pdf_data_excel.xlsx',
+                                                                           read_path=self.result_dir + 'pdf_data_excel.xlsx',
+                                                                           page_no=page_num, save_excel=result_save)
+                    # Handling Multiline with rules
+                    dataframe_write = self.handle_multiline_with_rule(df=dataframe_write)
+                    # Writing this updated frame to excel again
+                    self.write_excel_after_multiline_handling(src_frame=dataframe_write,
+                                                              save_path=self.result_dir + 'pdf_data_excel.xlsx',
+                                                              read_path=self.result_dir + 'pdf_data_excel.xlsx',
+                                                              page_no=page_num, save_excel=result_save)
+    
+                    # writing result to json file for testing
+                    # self.lookup_detections_df.to_json(self.result_dir + str(page_num) + '_detectionFrame.json')
+                    dataframe_write['page_no'] = page_num
+                    # dataframe_write.to_json(self.result_dir + str(page_num) + '_df_excelFrame.json')
+                """
+                return pixel_dic, dataframe, dataframe_write, df_raw
+            else:
+                logger.error('*** TABLE not detected for Page number : {} *** '.format(page_num))
+        return pixel_dic, dataframe, pd.DataFrame(columns=['pageNo']), df_raw
 
     def pdf_to_page_df_2(self, pdfpath, UID, page_list, result_save=False, save_result_dir='result'):
 
