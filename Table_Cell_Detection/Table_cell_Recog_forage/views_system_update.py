@@ -17,28 +17,34 @@ import PIL.Image as Image
 from openpyxl.workbook import Workbook
 from openpyxl import load_workbook
 
-''' ------------------------------------   using YOLO v5    ------------------------- '''
-# from yolov5.yolo_detection import Yolov5Inference
+warnings.filterwarnings('ignore')
+
+'''------------------------------------ Setting Logger --------------------------------'''
+
+logging.basicConfig(filename="LogFile_table_cell.log",
+                    format='%(asctime)s %(message)s'
+                    )
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 ''' ------------------------------------ using MMCV as model --------------------------- '''
-import mmcv
 from mmdet.apis import init_detector, inference_detector
-
-logger = logging.getLogger(__name__)
-warnings.filterwarnings('ignore')
 
 try:
     FILE = Path(__file__).resolve()
     ROOT = FILE.parents[0]  # YOLOv5 root directory
-    ROOT = ROOT.replace("\\", "/")
+    ROOT = ROOT.replace("\\", "/") + '/'
 except:
     ROOT = os.getcwd()
-    ROOT = ROOT.replace("\\", "/")
+    ROOT = ROOT.replace("\\", "/") + '/'
+
+logger.info('\n\n\t\t--------------------- Root Directory is : {} -------------------\t\n'.format(ROOT))
 
 
 class PyMuPdf:
+
     def __init__(self):
-        self.logger = logging.getLogger(__name__)
+
         self.doc = None
         self.source = None
         self.result_dir = None
@@ -54,6 +60,12 @@ class PyMuPdf:
         self.cell_det_threshold = 0.8
         self.table_model = None
         self.table_det_threshold = 0.9
+        self.column_model = None
+        self.column_det_threshold = 0.9
+
+        self. column_det = None
+
+        self.test = None
 
     def get_width(self, x0, x1):
         return int(x1-x0)
@@ -64,7 +76,7 @@ class PyMuPdf:
     def get_sourceid(self, row):
         return self.source
 
-    def draw_detetion_save_img(self, tbl_lst, img_p, page_num, name_of_file='_result.jpeg'):
+    def draw_detetion_save_img(self, tbl_lst, img_p, page_num, name_of_file='_result.jpeg', result_save=False):
         '''
         tbl_list is a standard format used across the table detection code
         tbl_list format : [ x1,y1, x2, y2, labl, conf]
@@ -72,7 +84,10 @@ class PyMuPdf:
         or it could be a dataframe having all detections stored
         '''
 
-        img = cv2.imread(img_p)
+        if isinstance(img_p, np.ndarray):
+            img = img_p.copy()
+        else:
+            img = cv2.imread(img_p)
         if isinstance(tbl_lst, list):
             for det in tbl_lst:
                 x1 = det[0]
@@ -81,21 +96,31 @@ class PyMuPdf:
                 y2 = det[3]
                 label = det[4]
                 img = cv2.rectangle(img, (x1,y1), (x2,y2), color=(255,0, 255), thickness=2)
-            cv2.imwrite(self.result_dir + str(page_num)+name_of_file, img)
+            if result_save:
+                cv2.imwrite(self.result_dir + str(page_num)+name_of_file, img)
 
         if isinstance(tbl_lst, pd.DataFrame):
             for i in range(len(tbl_lst)):
                 cv2.rectangle(img, (tbl_lst.loc[i, 'x'], tbl_lst.loc[i, 'y']), (tbl_lst.loc[i, 'x'] + tbl_lst.loc[i, 'w'], tbl_lst.loc[i, 'y'] + tbl_lst.loc[i, 'h']),
                               color=(255, 0, 255), thickness=2)
-            cv2.imwrite(self.result_dir + str(page_num) + name_of_file, img)
-        return tbl_lst
+            if result_save:
+                cv2.imwrite(self.result_dir + str(page_num) + name_of_file, img)
 
     def get_lookup_detection_frame(self, det_lst, ref_frame):
-        df = pd.DataFrame(columns=['x', 'y', 'w', 'h', 'x2', 'y2', 'label'])
+        '''
+        This Function creates a dataframe of detections made by the model
+        Input:
+                det_lst         :   List of detections in table_list format
+                ref_frame       :   self.lookup_category_id_annotation_df
+        Output:
+                df_             :   Dataframe of table_list Detection
+        '''
+        df = pd.DataFrame(columns=['x', 'y', 'w', 'h', 'x2', 'y2', 'label', ])
         for d in det_lst:
             x1, y1, x2, y2, label, conf = d
-            df = df.append({'x': x1, 'y': y1, 'w': x2 - x1, 'h': y2 - y1, 'x2': x2, 'y2': y2, 'label': label}, ignore_index=True)
-            df = df.sort_values(['y', 'x'], ascending=True)
+            if conf> 0.8:
+                df = df.append({'x': x1, 'y': y1, 'w': x2 - x1, 'h': y2 - y1, 'x2': x2, 'y2': y2, 'label': label, 'conf':conf}, ignore_index=True)
+                df = df.sort_values(['y', 'x'], ascending=True)
 
         df_ = pd.merge(df, ref_frame, how='left', left_on='label', right_on='name')
 
@@ -465,6 +490,10 @@ class PyMuPdf:
         return df0
 
     def is_overlap_check_along_rows(self, ax1, ax2, aw, bx1, bx2, bw):
+        '''
+        This Function checks if there is an overlap between
+        x - coordinates of cells of boxes, irrespective of the y- coordinate
+        '''
         if aw < bw:
             if ((ax1 >= bx1) and (ax2 > bx1)) and ((ax1 < bx2) and (ax2 <= bx2)):
                 return True
@@ -483,6 +512,9 @@ class PyMuPdf:
                     return True
 
     def isRectangleOverlap(self, R1, R2):
+        '''
+        This function detects if two rectangles overlap
+        '''
 
         if (R1[0] >= R2[2]) or (R1[2] <= R2[0]) or (R1[3] <= R2[1]) or (R1[1] >= R2[3]):
             return False
@@ -906,7 +938,7 @@ class PyMuPdf:
         if save_excel:
             if os.path.exists(read_path):
                 myworkbook = load_workbook(read_path)
-                #os.remove(read_path)
+                # os.remove(read_path)
             else:
                 myworkbook = Workbook()
             if 'Sheet' in myworkbook.sheetnames:
@@ -928,9 +960,182 @@ class PyMuPdf:
         else:
             return False
 
+    def column_detection_intrim_pred(self, src_img, det_df, page_n):
+
+        # identify unique tables detected by Table Model
+        uniq_table_id = list(det_df['table_id'].unique())
+        df_col_header = pd.DataFrame(columns=['x', 'y', 'w', 'h', 'x2', 'y2', 'name', 'conf'])
+
+        for e in uniq_table_id:
+            df_temp = det_df.loc[det_df['table_id'] == e]
+            df_temp = df_temp[['t_x', 't_y', 't_w', 't_h']]
+            df_temp.drop_duplicates(inplace=True)
+
+            for ind in df_temp.index:
+                tx0 = df_temp.loc[ind, 't_x']
+                ty0 = df_temp.loc[ind, 't_y']
+                tx1 = df_temp.loc[ind, 't_w'] + tx0
+                ty1 = df_temp.loc[ind, 't_h'] + ty0
+
+                # crop image for table
+                crop_img = src_img[ty0:ty1, tx0:tx1]
+                # run column detection model
+                column_pred = self.get_table_v2(crop_img, page_n=page_n,object_names_list=['column'])
+
+                for colde in column_pred:
+                    dx1, dy1, dx2, dy2, cls_label, conf = colde
+                    if conf > 0.9:
+                        df_col_header = df_col_header.append(
+                            {'x': dx1 + tx0, 'y': dy1 + ty0, 'w': ((dx2 + tx0) - (dx1 + tx0)),
+                             'h': ((dy2 + ty0) - (dy1 + ty0)), 'x2': dx2 + tx0, 'y2': dy2 + ty0,
+                             'name': cls_label, 'conf': conf}, ignore_index=True)
+
+        df_col_header.sort_values(['x'], inplace=True)
+        df_col_header = df_col_header.reset_index(drop=True)
+        return df_col_header
+
+    def identify_headers(self, src_df, col_det_df):
+        '''
+        src_df      :   Dataframe with metadata and table -cell overlap
+        col_det_df  :   Dataframe of detections by column Model
+        '''
+        for src_ind in src_df.index:
+            src_rec = [src_df.loc[src_ind, 'x'], src_df.loc[src_ind, 'y'],
+                       src_df.loc[src_ind, 'x'] + src_df.loc[src_ind, 'w'],
+                       src_df.loc[src_ind, 'y'] + src_df.loc[src_ind, 'h']]
+            for coldet_ind in col_det_df.index:
+                label = col_det_df.loc[coldet_ind, 'name']
+                if label in ['header', 'headers']:
+                    coldet_rec = [col_det_df.loc[coldet_ind, 'x'], col_det_df.loc[coldet_ind, 'y'],
+                                  col_det_df.loc[coldet_ind, 'x2'], col_det_df.loc[coldet_ind, 'y2']]
+                    if self.isRectangleOverlap(coldet_rec, src_rec):
+                        src_df.loc[src_ind, 'header'] = 1
+        return src_df
+
+    def column_creation(self,  src_df, columdet):
+        header_flag = -1
+        frame = src_df.loc[src_df['header'] == 1]
+        # check to see if 'HEADER' is detected
+        if len(frame) > 0:                                      # HEADER is present in detection from Column model
+            header_flag = 1
+            frame.sort_values(['x'], inplace=True)
+            frame = frame.reset_index(drop=False)
+            for ind in frame.index:
+                hx1 = frame.loc[ind, 'x']
+                hx2 = frame.loc[ind, 'x'] + frame.loc[ind, 'w']
+                for indcol in columdet.index:
+                    name = columdet.loc[indcol, 'name']
+                    if name not in ['header']:
+                        colx1 = columdet.loc[indcol, 'x']
+                        colx2 = columdet.loc[indcol, 'x2']
+                        if hx1 >= colx1 and hx2 <= colx2 and frame.loc[ind, 'col'] == -1:
+                            frame.loc[ind, 'col'] = indcol
+                        else:
+                            if hx1 < colx1 and frame.loc[ind, 'col'] == -1:
+                                frame.loc[ind, 'col'] = -99
+        else:                                                   # if ONLY Column was detected and no Header was found
+            src_df.sort_values(['x', 'y'], inplace=True)
+            src_df = src_df.reset_index(drop=True)
+
+            columdet.sort_values(['x', 'y'], inplace=True)
+            zcol_det_df = columdet.reset_index(drop=True)
+            # using metadata here
+            for i in range(len(src_df)):
+                src_x = src_df.loc[i, 'x']
+                src_x2 = src_x + src_df.loc[i, 'w']
+                for jind in zcol_det_df.index:
+                    col_x = zcol_det_df.loc[jind, 'x']
+                    col_x2 = zcol_det_df.loc[jind, 'x2']
+
+                    # check complete overlap
+                    if src_x >= col_x and src_x2 <= col_x2 and src_df.loc[i, 'col'] == -1:
+                        src_df.loc[i, 'col'] = jind
+            frame = src_df.copy()
+
+        # this code creates the ctr for unidentified words in header
+        ctr = 10
+        for i in range(len(frame)):
+            val = frame.loc[i, 'col']
+            nextval = None
+            temp = []
+            if val < 0:
+                temp.append(i)
+                flag = -1
+                for j in range(i + 1, len(frame)):
+                    jval = frame.loc[j, 'col']
+                    if flag < 0 and jval < 0:
+                        temp.append(j)
+                    else:
+                        flag = 1
+                        nextval = frame.loc[j, 'col']
+                        break
+            for k in temp:
+                frame.loc[k, 'col'] = ctr
+            ctr = ctr + 1
+        #
+        dic = {}
+        unique_col = list(frame['col'].unique())
+        for e in unique_col:
+            temp_df = frame[frame['col'] == e]
+            dic.update({e: [min(temp_df['x']), max(temp_df['x'] + temp_df['w'])]})
+        new = pd.DataFrame.from_dict(dic)
+        new = new.transpose()
+        new = new.sort_values(by=[0])
+        new = new.reset_index(drop=False)
+
+        lst = []
+
+        for ind in new.index:
+            old_val = new.loc[ind, 'index']
+            new_val = ind
+            for k in range(len(frame)):
+                if frame.loc[k, 'col'] == old_val:
+                    lst.append(new_val)
+        frame['col'] = lst
+
+        if header_flag < 0:
+            src_df = frame.copy()
+
+        if header_flag > 0:
+            # setting new col values identified into source Fame
+            for i in range(len(frame)):
+                colval = frame.loc[i, 'col']
+                index_val = frame.loc[i, 'index']
+                src_df.loc[index_val, 'col'] = colval
+        new = new.drop('index', axis=1)
+
+        return src_df, new
+
+    def column_corr_final(self, src_df, col_range_frame):
+        '''
+        This function is used to updtate column values
+        using detections from Column Model
+        src_df              :   Dataframe
+        col_range_frame     :      prepared using column detection model
+        '''
+        for ind in src_df.index:
+            colvalue = src_df.loc[ind, 'col']
+            if colvalue < 0:
+                cell_x1 = src_df.loc[ind, 'c_x']
+                cell_w = src_df.loc[ind, 'c_w']
+                cell_x2 = cell_x1 + cell_w
+
+                for detind in col_range_frame.index:
+                    x1 = col_range_frame.loc[detind, 0]
+                    x2 = col_range_frame.loc[detind, 1]
+                    w = x2 - x1
+
+                    boo = self.is_overlap_check_along_rows(cell_x1, cell_x2, cell_w, x1, x2, w)
+                    # print((cell_x1, cell_x2, cell_w, x1, x2, w, boo, ind, detind))
+                    if boo:
+                        src_df.loc[ind, 'col'] = detind
+                        break
+        return src_df
+
     def model_init(self, model_name, det):
         if model_name in ['yolov5']:
             print('\n\t****** Initializing YOLOv5 Architecture for {} ****** '.format(det))
+            logger.info('\t****** Initializing YOLOv5 Architecture for {} ****** '.format(det))
             if det.lower() in ['cell', 'cells']:
 
                 # cell model initialization
@@ -939,9 +1144,12 @@ class PyMuPdf:
                 # WEIGHTS and YAML files
                 weights_path_cell_detection = str(ROOT) + '/table_cell_config/cell_030122_12_06pm_best.pt'
                 yaml_path_cell_detection = str(ROOT) + '/table_cell_config/cells.yaml'
-                print('\n****** Looking for Cell Model Files at following path ****** ')
+                print('\n****** Looking for Cell Model Files at following path ******')
                 print('WEIGHTS file path : ', weights_path_cell_detection)
                 print('YAML file path    : ', yaml_path_cell_detection)
+                logger.info('\n****** Looking for Cell Model Files at following path ******')
+                logger.info('WEIGHTS file path : {} '.format(weights_path_cell_detection))
+                logger.info('YAML file path    : {} '.format(yaml_path_cell_detection))
                 self.cell_model.model_init(weight_file_path=weights_path_cell_detection,
                                             yaml_file_path=yaml_path_cell_detection)
 
@@ -956,29 +1164,55 @@ class PyMuPdf:
                 print('\n****** Looking for Table Model Files at following path ****** ')
                 print('WEIGHTS file path : ', weights_path_table_detection)
                 print('YAML file path    : ', yaml_path_table_detection)
+                logger.info('\n****** Looking for Table Model Files at following path ******')
+                logger.info('WEIGHTS file path : {} '.format(weights_path_table_detection))
+                logger.info('YAML file path    : {} '.format(yaml_path_table_detection))
                 self.table_model.model_init(weight_file_path=weights_path_table_detection,
                                             yaml_file_path=yaml_path_table_detection)
 
         if model_name in ['mmlab', 'mmdet']:
-
+            logger.info('\t****** Initializing mmdetection RCNN Architecture for {} ****** '.format(det))
             if det.lower() in ['cell', 'cells']:
                 weights_path_cell_detection = str(ROOT) + '/table_cell_config/cell_cascadeRCNN_epoch_50.pth'
                 config_cell_detection = str(ROOT) + '/mmdet/configs/cascade_rcnn/cascade_rcnn_r101_fpn_1x_coco_custom_cell.py'
+
                 print('\n****** Looking for Cell Model Files at following path ****** ')
                 print('WEIGHTS file path    : ', weights_path_cell_detection)
                 print('CONFIG file path     : ', config_cell_detection)
 
+                logger.info('\t****** Looking for Cell Model Files at following path ******')
+                logger.info('WEIGHTS file path : {} '.format(weights_path_cell_detection))
+                logger.info('YAML file path    : {} '.format(config_cell_detection))
+
                 self.cell_model = init_detector(config_cell_detection, weights_path_cell_detection, device='cpu')
 
             elif det.lower() in ['table', 'tables']:
+                weights_path_table_detection = str(ROOT) + '/table_cell_config/table_cascadeRCNN_epoch_20.pth'
+                config_table_detection = str(ROOT) + '/mmdet/configs/cascade_rcnn/cascade_rcnn_r101_fpn_1x_coco_custom.py'
 
-                    weights_path_table_detection = str(ROOT) + '/table_cell_config/table_cascadeRCNN_epoch_20.pth'
-                    config_table_detection = str(ROOT) + '/mmdet/configs/cascade_rcnn/cascade_rcnn_r101_fpn_1x_coco_custom.py'
-                    print('\n****** Looking for Table Model Files at following path ****** ')
-                    print('WEIGHTS file path    : ', weights_path_table_detection)
-                    print('CONFIG file path     : ', config_table_detection)
+                print('\n****** Looking for Table Model Files at following path ****** ')
+                print('WEIGHTS file path    : ', weights_path_table_detection)
+                print('CONFIG file path     : ', config_table_detection)
 
-                    self.table_model = init_detector(config_table_detection, weights_path_table_detection, device='cpu')
+                logger.info('\t****** Looking for Table Model Files at following path ******')
+                logger.info('WEIGHTS file path : {} '.format(weights_path_table_detection))
+                logger.info('YAML file path    : {} '.format(config_table_detection))
+
+                self.table_model = init_detector(config_table_detection, weights_path_table_detection, device='cpu')
+
+            elif det.lower() in ['column', 'header']:
+                weights_path_column_detection = str(ROOT) + '/table_cell_config/epoch_50_column.pth'
+                config_column_detection = str(ROOT) + '/mmdet/configs/cascade_rcnn/cascade_rcnn_r101_fpn_1x_coco_custom_column.py'
+
+                print('\n******  Looking for Column / Header Model Files at following path ****** ')
+                print('WEIGHTS file path    : ', weights_path_column_detection)
+                print('CONFIG file path     : ', config_column_detection)
+
+                logger.info('\t****** Looking for Column / Header Model Files at following path ******')
+                logger.info('WEIGHTS file path : {} '.format(weights_path_column_detection))
+                logger.info('YAML file path    : {} '.format(config_column_detection))
+
+                self.column_model = init_detector(config_column_detection, weights_path_column_detection, device='cpu')
 
     def restructure_yolov5_predictions(self, table_pred, cell_pred):
         '''
@@ -1056,10 +1290,13 @@ class PyMuPdf:
             if cls_label in ['gridless_table', 'grided_table', 'semi_grided_table', 'key_value'] and conf > self.table_det_threshold:
                 temp = [x1, y1, x2, y2, cls_label, conf]
                 new_pred.append(temp)
+            else:
+                temp = [x1, y1, x2, y2, cls_label, conf]
+                new_pred.append(temp)
 
         return new_pred
 
-    def get_table_v2(self, image_np, page_n, object_names_list=['table', 'cell']):
+    def get_table_v2(self, image_np, page_n, object_names_list=['table', 'cell', 'column']):
         '''
         FOR MMDET detections (MaskRCNN / RCNN)
         This function takes input:
@@ -1070,26 +1307,31 @@ class PyMuPdf:
         table_pred          : A List of predictions in table_list_format
         '''
 
-        if ('table' in object_names_list) and self.table_model:
-            table_pred = inference_detector(self.table_model, image_np)
-            table_pred = self.restructure_mmdet_predictions(table_pred, model=self.table_model)
+        if ('table' in object_names_list) or ('cell' in object_names_list):
+            if ('table' in object_names_list) and self.table_model:
+                table_pred = inference_detector(self.table_model, image_np)
+                table_pred = self.restructure_mmdet_predictions(table_pred, model=self.table_model)
 
-        if ('cell' in object_names_list) and self.cell_model:
-            cell_pred = inference_detector(self.cell_model, image_np)
-            cell_pred = self.restructure_mmdet_predictions(cell_pred, model=self.cell_model)
+            if ('cell' in object_names_list) and self.cell_model:
+                cell_pred = inference_detector(self.cell_model, image_np)
+                cell_pred = self.restructure_mmdet_predictions(cell_pred, model=self.cell_model)
 
-        print('\n\n\t\t For page_n : ', page_n)
-        # print(len(table_pred), len(cell_pred))
-        table_pred.extend(cell_pred)
-        # print(len(table_pred), len(cell_pred))
-        return table_pred
+            table_pred.extend(cell_pred)
+            return table_pred
+
+        if 'column' in object_names_list:
+            column_pred = inference_detector(self.column_model, image_np)
+            column_pred = self.restructure_mmdet_predictions(column_pred, model=self.column_model)
+            return column_pred
 
     def pdf_to_page_df_mypypdf_intrim(self, page_num, result_save):
-        """
+        '''
         This function extrats information for each page
-        :param page_num: Page number of PDF
-        :return:
-        """
+        :param
+                page_num        :   Page number of PDF
+                result_save     :   Boolean value, used to evaluate if subsequent images generated must be saved or not
+
+        '''
 
         dataframe_write = None                                              # Dataframe equivalent for excel
         pixel_dic = dict()                                                  # Local to Page Resolution Info
@@ -1149,100 +1391,149 @@ class PyMuPdf:
             dataframe["c_y"] = -1
             dataframe["c_w"] = -1
             dataframe["c_h"] = -1
+            dataframe['header'] = -1
+            dataframe['col'] = -1
 
             df_raw = dataframe.copy()
-            dataframe.to_json(self.result_dir + str(page_num)+'_df0_before_processing.json')
-
             # ---------------------------------- DEEP LEARNING MODEL FOR DETECTION ---------------------------------
             # DL Model Run   ----- NOTE : table_list has following format : [x0, y0, x1, y1, label, conf]
 
-            table_list = self.get_table_v2(open_cv_image, page_num, object_names_list=['table', 'cell'])   # mmlab model
-            # table_list = self.get_detection_maskrcnn(open_cv_image, page_num)                         # MaskRCNN model
-            # table_list = self.get_detection_yolov5(open_cv_image, page_num)                            # YOLO v5 model
-
-            self.draw_detetion_save_img(table_list, image_name, page_num, name_of_file='_result_of_bbox_detected.jpeg')
-
-            # ------------------------------------------------------------------------------------------------------
-
-            # creating a dataframe of all detections made by the model
+            # mmlab Model
+            table_list = self.get_table_v2(open_cv_image, page_num, object_names_list=['table', 'cell'])
+            # creating a dataframe of all detections made by the model : List ---> Dataframe
             self.lookup_detections_df = self.get_lookup_detection_frame(table_list, self.lookup_category_id_annotation_df)
-            self.lookup_detections_df.to_json(self.result_dir + str(page_num) + '_det_frame_1_table_list.json')
 
-            # get undetected parts of image and save it
-            undet_img = self.get_undetected_parts_img(image_name, table_list, page_num, save_img=True)
+            # get undetected parts in a IMAGE and SAVE the Masked Image
+            self.get_undetected_parts_img(image_name, table_list, page_num, save_img=result_save)
 
+            # Draw the detections identified by Model
+            self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num, name_of_file='_result_of_bbox_detected.jpeg', result_save=result_save)
+
+            # -----------------------------------------------------------------------------------------
             # fill dataframe with overlap information of table and cells from Model
             dataframe = self.df_to_table_df_v2(input_df=dataframe, det_df=self.lookup_detections_df)
-            dataframe.to_json(self.result_dir + str(page_num) + '_df1_overlap_table_cell.json')
 
             img_buffer = io.BytesIO()
             im_resized.save(img_buffer, dpi=(600, 600), format="jpeg")
 
             # get undetected annotations of undetected_img and add update the detection dataframe in __init__
             dataframe, self.lookup_detections_df = self.get_undetected_parts_bbox(input_df=dataframe, det_df=self.lookup_detections_df, ref_frame=self.lookup_category_id_annotation_df)
-
-            self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num, name_of_file='_result_of_improved_bbox.jpeg')
-
-            dataframe.to_json(self.result_dir + str(page_num) + '_df2_get_undetected_dataframe_0.json')
-            self.lookup_detections_df.to_json(self.result_dir + str(page_num) + '_det_frame_2_table_list_undetadded.json')
+            # Draw the detections updated by rule for undetected part
+            self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num, name_of_file='_result_of_improved_bbox.jpeg', result_save=result_save)
 
             # -----------------  doing post corrections --------------------------
             # STEP 1 : Identifying values that belong to table and have been successfully detected
             dataframe = dataframe.loc[(dataframe['is_in_cell'] == 1)]
             dataframe = dataframe.loc[(dataframe['is_in_table'] == 1)]
-            dataframe.to_json(self.result_dir + str(page_num) + '_df_3_table_cell_area.json')
+
             # STEP 2 : Lines sequence of words are corrected
             dataframe = self.line_num_correction(src_df=dataframe)
-            dataframe.to_json(self.result_dir + str(page_num) + '_df_4_line_corr.json')
+
             # STEP 3 : Word sequence horizontally are corrected
             dataframe = self.word_num_corr(src_df=dataframe)
-            dataframe.to_json(self.result_dir + str(page_num) + '_df_5_word_corr.json')
-            # STEP 4 : Column identification and correction of Block values / Column values
-            dataframe = self.block_corr_final(src_df=dataframe)
-            dataframe.to_json(self.result_dir + str(page_num) + '_df_6_block_corr.json')
+
+            #try:
+            # step 4 : new column detection model
+            # a. Prediction by Column/ Header detection Model
+            column_detection = self.column_detection_intrim_pred(open_cv_image, dataframe, page_n=page_num)
+            self.column_det = column_detection.copy()
+            # Draw the detections updated by rule for undetected part
+            self.draw_detetion_save_img(column_detection, image_name, page_num, name_of_file='_col_header.jpeg', result_save=result_save)
+            # b. Idetify headers in the dataset
+            dataframe = self.identify_headers(dataframe, column_detection)
+            self.test = dataframe.copy()
+
+            # c. Column min_max_creation --> new_col_lengths
+            dataframe, new_col_lengths = self.column_creation(dataframe, column_detection)
+            self.test1 = dataframe.copy()
+            self.test2 = new_col_lengths.copy()
+            dataframe = self.column_corr_final(dataframe, new_col_lengths)
+            self.test3 = dataframe.copy()
+            dataframe['block_n'] = dataframe['col']
+
             # STEP 4.a : Handling Multilines detected by model
             orig_dataframe, dataframe = self.identify_cell_ids_with_multiline(src=dataframe)
             # STEP 4.b : Handling Multiline part2
             dataframe = self.multiline_correction_final(dataframe)
+
+
             # STEP 5 : Write result to EXCEL File
             dataframe = dataframe.sort_values(['cell_id', 'c_x', 'c_y'])
             dataframe.reset_index(drop=True, inplace=True)
-            dataframe.to_json(self.result_dir + str(page_num) + '_df_7_multilinehandle.json')
+
             # dataframe_write is dataframe which is near perfect excel format
-            dataframe_write = self.writing_formated_table_to_excel(src_frame=dataframe, save_path=self.result_dir +'pdf_data_excel.xlsx', read_path=self.result_dir +'pdf_data_excel.xlsx', page_no=page_num, save_excel=result_save)
-            dataframe_write.to_json(self.result_dir + str(page_num) + '_df_8_excel_write1.json')
+            dataframe_write = self.writing_formated_table_to_excel(src_frame=dataframe, save_path=self.result_dir + 'pdf_data_excel.xlsx', read_path=self.result_dir + 'pdf_data_excel.xlsx', page_no=page_num, save_excel=result_save)
             # Handling Multiline with rules
             dataframe_write = self.handle_multiline_with_rule(df=dataframe_write)
-            dataframe_write.to_json(self.result_dir + str(page_num) + '_df_8_excel_write2_multiline_rules_applied.json')
-
             # Writing this updated frame to excel again
-            self.write_excel_after_multiline_handling(src_frame=dataframe_write, save_path=self.result_dir +'pdf_data_excel.xlsx', read_path=self.result_dir +'pdf_data_excel.xlsx', page_no=page_num, save_excel =result_save)
+            self.write_excel_after_multiline_handling(src_frame=dataframe_write, save_path=self.result_dir + 'pdf_data_excel.xlsx', read_path=self.result_dir + 'pdf_data_excel.xlsx', page_no=page_num, save_excel=result_save)
 
             # writing result to json file for testing
             # self.lookup_detections_df.to_json(self.result_dir + str(page_num) + '_detectionFrame.json')
             dataframe_write['page_no'] = page_num
-            dataframe_write.to_json(self.result_dir + str(page_num) + '_df_excelFrame.json')
+            # dataframe_write.to_json(self.result_dir + str(page_num) + '_df_excelFrame.json')
+            """
+            except:
+                logger.info(' Inside Exception Entering to old method for block correction}')
+                logger.info(' for page number \t\t {}'.format(page_num))
+                logger.info(' for page number \t\t {}'.format(self.result_dir))
+                # STEP 4 : Column identification and correction of Block values / Column values
+                dataframe = self.block_corr_final(src_df=dataframe)
+                # STEP 4.a : Handling Multilines detected by model
+                orig_dataframe, dataframe = self.identify_cell_ids_with_multiline(src=dataframe)
+                # STEP 4.b : Handling Multiline part2
+                dataframe = self.multiline_correction_final(dataframe)
 
+                # STEP 5 : Write result to EXCEL File
+                dataframe = dataframe.sort_values(['cell_id', 'c_x', 'c_y'])
+                dataframe.reset_index(drop=True, inplace=True)
+                self.test = dataframe.copy()
+                # dataframe_write is dataframe which is near perfect excel format
+                dataframe_write = self.writing_formated_table_to_excel(src_frame=dataframe,
+                                                                       save_path=self.result_dir + 'pdf_data_excel.xlsx',
+                                                                       read_path=self.result_dir + 'pdf_data_excel.xlsx',
+                                                                       page_no=page_num, save_excel=result_save)
+                # Handling Multiline with rules
+                dataframe_write = self.handle_multiline_with_rule(df=dataframe_write)
+                # Writing this updated frame to excel again
+                self.write_excel_after_multiline_handling(src_frame=dataframe_write,
+                                                          save_path=self.result_dir + 'pdf_data_excel.xlsx',
+                                                          read_path=self.result_dir + 'pdf_data_excel.xlsx',
+                                                          page_no=page_num, save_excel=result_save)
+
+                # writing result to json file for testing
+                # self.lookup_detections_df.to_json(self.result_dir + str(page_num) + '_detectionFrame.json')
+                dataframe_write['page_no'] = page_num
+                # dataframe_write.to_json(self.result_dir + str(page_num) + '_df_excelFrame.json')
+            """
             return pixel_dic, dataframe, dataframe_write, df_raw
 
-    def pdf_to_page_df_2(self, pdfpath, UID, page_list, version='v2', result_save=False, save_result_dir='result'):
+
+
+    def pdf_to_page_df_2(self, pdfpath, UID, page_list, result_save=False, save_result_dir='result'):
+
+        global logger
 
         self.source = UID
 
         # creating directory to save Results
-        self.result_dir = os.getcwd() +'/'+ save_result_dir
-        os.makedirs(self.result_dir, exist_ok=True)
+        self.result_dir = os.getcwd() + '/' + save_result_dir + '/'
+        os.makedirs(self.result_dir, mode=0o777, exist_ok=True)
         print('\n*** NOTE : Results will be stored in location : ', self.result_dir, '\n')
+        logger.info('\t*** NOTE : Results will be stored in location : {} *********'.format(self.result_dir))
 
         # --------------------------------------  Deep Learning Model Initialization -------------------------------
         if self.table_model is None:
             self.model_init(model_name='mmdet', det='table')
         if self.cell_model is None:
             self.model_init(model_name='mmdet', det='cell')
+        if self.column_model is None:
+            self.model_init(model_name='mmdet', det='column')
         # ----------------------------------------------------------------------------------------------------------
 
         extra = {'request_id': 'UniqueRunId:' + str(UID)}
-        self.logger = logging.LoggerAdapter(self.logger, extra)
+        logger.info(extra)
+        logger.info(' Deep Learning Model output has a format as follows : [x0, y0, x1, y1, label, conf] ')
         self.doc = fitz.Document(pdfpath)
 
         page_info = {}
@@ -1254,20 +1545,23 @@ class PyMuPdf:
         Table_data = []
 
         for page_no in page_list:
+            logger.info('\n\t\t\t\t\t\t--- Processing Page Number : {} ----\n'.format(page_no))
+            print('\t\t\t\t\t page_n : ', page_no)
             # calling the function where detection and processing takes place ---------------------------------
-            pixel_dic, dataframe, excel_data, raw_df = self.pdf_to_page_df_mypypdf_intrim(page_num=page_no, result_save=result_save)
-            
+            pixel_dic, dataframe, excel_data, raw_df = self.pdf_to_page_df_mypypdf_intrim(page_num=page_no,
+                                                                                          result_save=result_save)
+
             page_info.update({str(page_no): pixel_dic})
             final_df = final_df.append(dataframe, ignore_index=True)
             excel_df = excel_df.append(excel_data, ignore_index=True)
             final_df_raw = final_df_raw.append(raw_df, ignore_index=True)
 
             # Response
-            table_data = excel_data.to_dict()
-            Table_data.append({'page_no': page_no,  'table_json': table_data})
+            #table_data = excel_data.to_dict()
+            #Table_data.append({'page_no': page_no, 'table_json': table_data})
 
         response_json.update({'page_data': final_df.to_json(orient='split'),
-                              'page_excel_data' : excel_df.to_json(orient='split'),
+                              'page_excel_data': excel_df.to_json(orient='split'),
                               'raw_data': final_df_raw.to_json(orient='split'),
                               'Table_data': Table_data,
                               'status_code': 100,
@@ -1276,11 +1570,17 @@ class PyMuPdf:
         return page_info, final_df, final_df_raw, excel_df, response_json
 
 
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\2020141.pdf'    # [38, 39, 40, 41]
-# pdf_file_path = r'D:\ForageAI\tables_project\table_cell\20207.pdf'    # [36, 38]
+pdf_file_path = r'D:\ForageAI\tables_project\table_cell\2020141.pdf'    # [54,55,56,57,41,42,43,44,62,24,37,38,39,40,58,59,60,61,45,49]
+pdf_file_path = r'D:\ForageAI\tables_project\table_cell\20207.pdf'
+pdf_file_path = pdf_file_path.replace("\\", "/")
+resul_dir = pdf_file_path.split('/')[-1].split('.')[0]
 obj = PyMuPdf()
-page_info, final_df, final_df_raw, excel_df, resp = obj.pdf_to_page_df_2(pdfpath=pdf_file_path, UID='1',
-                                                                   page_list=[54,55,56,57,41,42,43,44,62,24,37,38,39,40,58,59,60,61,45,49],
+page_info, final_df, final_df_raw, excel_df, resp = obj.pdf_to_page_df_2(pdfpath=pdf_file_path, UID=resul_dir,
+                                                                   page_list=[36],
                                                                    result_save=True,
-                                                                   save_result_dir='2020141/')
+                                                                   save_result_dir='pdf_to_excel_output/'+resul_dir)
+
+
+
+
 
