@@ -233,7 +233,7 @@ class PyMuPdf:
 
         return input_df, final_
 
-    def get_undetected_parts_bbox(self, input_df, det_df, ref_frame):
+    def get_undetected_parts_bbox_v2_old(self, input_df, det_df, ref_frame):
         '''
         this function identifies the undetected cells and their coordinates.
         These new bbox cordinates are updated to model detetion output.
@@ -443,6 +443,82 @@ class PyMuPdf:
         src = src.reset_index(drop=True)
         det_df_copy = src.append(tab)
         det_df_copy.reset_index(drop=True, inplace=True)
+
+        return input_df, det_df_copy
+
+    def get_undetected_parts_bbox(self, input_df, det_df, ref_frame):
+
+        det_df_copy = det_df.copy()
+        det_tab = det_df.loc[det_df['supercategory'] == 'table']
+        det_sen = det_df.loc[det_df['supercategory'] == 'sentence']
+
+        # removing all detections outside table
+        # if sentence detections overlap with table coordinates we keep it else Removed
+        for sind in det_sen.index:
+            R1 = [det_sen.loc[sind, 'x'], det_sen.loc[sind, 'y'], det_sen.loc[sind, 'x2'], det_sen.loc[sind, 'y2']]
+            for tind in det_tab.index:
+                R2 = [det_tab.loc[tind, 'x'], det_tab.loc[tind, 'y'], det_tab.loc[tind, 'x2'], det_tab.loc[tind, 'y2']]
+                boo = self.isRectangleOverlap(R1, R2)
+                if boo is True:
+                    pass
+                else:
+                    det_df_copy.drop(sind, axis=0, inplace=True)
+
+        # det_df_copy  --->  Cells detected by Model inside Table Frame
+        det_df_copy.drop_duplicates(inplace=True)
+        det_df_copy.reset_index(drop=True, inplace=True)
+
+        # undetected_text identified using Metadata
+        new_df = input_df[(input_df['is_in_cell'] == 0) & (input_df['is_in_table'] == 1)]
+        # creating an empty dataframe
+        undet_frame = pd.DataFrame(columns=['x', 'y', 'w', 'h', 'x2', 'y2', 'label', 'conf', 'category_id', 'name', 'supercategory'])
+
+        # ---------------------- now we find overlap with exsisting Detections -------------
+
+        # Extract metadata infor of words that did not get detected and find X-overlaps
+        for i in new_df.index:
+            undet_x = new_df.loc[i, 'x']
+            undet_w = new_df.loc[i, 'w']
+            undet_x2 = undet_x + undet_w
+            undet_y = new_df.loc[i, 'y']
+            undet_h = new_df.loc[i, 'h']
+
+            xmin = 1000000
+            xmax = 0
+            flag = -1
+            for j in det_df_copy.index:
+                det_x = det_df_copy.loc[j, 'x']
+                det_x2 = det_df_copy.loc[j, 'x2']
+                det_w = det_df_copy.loc[j, 'w']
+                name = det_df_copy.loc[j, 'supercategory']
+                if name not in ['table']:
+                    boo = self.is_overlap_check_along_rows(undet_x, undet_x2, undet_w, det_x, det_x2, det_w)
+                    if boo:
+                        _, per = boo
+                        xmin = min(xmin, min(undet_x, det_x))
+                        xmax = max(max(undet_x2, det_x2), xmax)
+                        flag = 1
+            if flag > 0:
+                undet_frame = undet_frame.append(
+                    {'x': xmin, 'y': undet_y, 'w': xmax - xmin, 'h': undet_h, 'x2': xmax, 'y2': undet_y + undet_h,
+                     'label': 'cell', 'conf': 2, 'category_id': 4, 'name': 'cell', 'supercategory': 'sentence'},
+                    ignore_index=True)
+                undet_frame.drop_duplicates(inplace=True)
+            if flag < 0:
+                undet_frame = undet_frame.append(
+                    {'x': undet_x, 'y': undet_y, 'w': undet_w, 'h': undet_h, 'x2': undet_x2, 'y2': undet_y + undet_h,
+                     'label': 'cell', 'conf': 2, 'category_id': 4, 'name': 'cell', 'supercategory': 'sentence'},
+                    ignore_index=True)
+                undet_frame.drop_duplicates(inplace=True)
+
+
+        det_df_copy = det_df_copy.append(undet_frame, ignore_index=True)
+        det_df_copy.sort_values(by=['y', 'x'], inplace=True)
+        det_df_copy.drop_duplicates(inplace=True)
+        det_df_copy.reset_index(drop=True, inplace=True)
+
+        # rerunning cell overlap section again to incorporate new detections
+        input_df = self.df_to_table_df_v2(input_df=input_df, det_df=det_df_copy)
 
         return input_df, det_df_copy
 
@@ -1793,7 +1869,7 @@ class PyMuPdf:
                 return pixel_dic, dataframe, dataframe_write, df_raw
             else:
                 logger.error('*** TABLE not detected for Page number : {} *** '.format(page_num))
-        return pixel_dic, dataframe, pd.DataFrame(columns=['pageNo']), df_raw
+            return pixel_dic, dataframe, pd.DataFrame(columns=['pageNo']), df_raw
 
     def pdf_to_page_df_2(self, pdfpath, UID, page_list, result_save=False, save_result_dir='result'):
 

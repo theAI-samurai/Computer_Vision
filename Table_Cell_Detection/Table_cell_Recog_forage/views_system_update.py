@@ -229,7 +229,7 @@ class PyMuPdf:
 
         return input_df, final_
 
-    def get_undetected_parts_bbox(self, input_df, det_df, ref_frame):
+    def get_undetected_parts_bbox_v2_old(self, input_df, det_df, ref_frame):
         '''
         this function identifies the undetected cells and their coordinates.
         These new bbox cordinates are updated to model detetion output.
@@ -439,6 +439,82 @@ class PyMuPdf:
         src = src.reset_index(drop=True)
         det_df_copy = src.append(tab)
         det_df_copy.reset_index(drop=True, inplace=True)
+
+        return input_df, det_df_copy
+
+    def get_undetected_parts_bbox(self, input_df, det_df, ref_frame):
+
+        det_df_copy = det_df.copy()
+        det_tab = det_df.loc[det_df['supercategory'] == 'table']
+        det_sen = det_df.loc[det_df['supercategory'] == 'sentence']
+
+        # removing all detections outside table
+        # if sentence detections overlap with table coordinates we keep it else Removed
+        for sind in det_sen.index:
+            R1 = [det_sen.loc[sind, 'x'], det_sen.loc[sind, 'y'], det_sen.loc[sind, 'x2'], det_sen.loc[sind, 'y2']]
+            for tind in det_tab.index:
+                R2 = [det_tab.loc[tind, 'x'], det_tab.loc[tind, 'y'], det_tab.loc[tind, 'x2'], det_tab.loc[tind, 'y2']]
+                boo = self.isRectangleOverlap(R1, R2)
+                if boo is True:
+                    pass
+                else:
+                    det_df_copy.drop(sind, axis=0, inplace=True)
+
+        # det_df_copy  --->  Cells detected by Model inside Table Frame
+        det_df_copy.drop_duplicates(inplace=True)
+        det_df_copy.reset_index(drop=True, inplace=True)
+
+        # undetected_text identified using Metadata
+        new_df = input_df[(input_df['is_in_cell'] == 0) & (input_df['is_in_table'] == 1)]
+        # creating an empty dataframe
+        undet_frame = pd.DataFrame(columns=['x', 'y', 'w', 'h', 'x2', 'y2', 'label', 'conf', 'category_id', 'name', 'supercategory'])
+
+        # ---------------------- now we find overlap with exsisting Detections -------------
+
+        # Extract metadata infor of words that did not get detected and find X-overlaps
+        for i in new_df.index:
+            undet_x = new_df.loc[i, 'x']
+            undet_w = new_df.loc[i, 'w']
+            undet_x2 = undet_x + undet_w
+            undet_y = new_df.loc[i, 'y']
+            undet_h = new_df.loc[i, 'h']
+
+            xmin = 1000000
+            xmax = 0
+            flag = -1
+            for j in det_df_copy.index:
+                det_x = det_df_copy.loc[j, 'x']
+                det_x2 = det_df_copy.loc[j, 'x2']
+                det_w = det_df_copy.loc[j, 'w']
+                name = det_df_copy.loc[j, 'supercategory']
+                if name not in ['table']:
+                    boo = self.is_overlap_check_along_rows(undet_x, undet_x2, undet_w, det_x, det_x2, det_w)
+                    if boo:
+                        _, per = boo
+                        xmin = min(xmin, min(undet_x, det_x))
+                        xmax = max(max(undet_x2, det_x2), xmax)
+                        flag = 1
+            if flag > 0:
+                undet_frame = undet_frame.append(
+                    {'x': xmin, 'y': undet_y, 'w': xmax - xmin, 'h': undet_h, 'x2': xmax, 'y2': undet_y + undet_h,
+                     'label': 'cell', 'conf': 2, 'category_id': 4, 'name': 'cell', 'supercategory': 'sentence'},
+                    ignore_index=True)
+                undet_frame.drop_duplicates(inplace=True)
+            if flag < 0:
+                undet_frame = undet_frame.append(
+                    {'x': undet_x, 'y': undet_y, 'w': undet_w, 'h': undet_h, 'x2': undet_x2, 'y2': undet_y + undet_h,
+                     'label': 'cell', 'conf': 2, 'category_id': 4, 'name': 'cell', 'supercategory': 'sentence'},
+                    ignore_index=True)
+                undet_frame.drop_duplicates(inplace=True)
+
+
+        det_df_copy = det_df_copy.append(undet_frame, ignore_index=True)
+        det_df_copy.sort_values(by=['y', 'x'], inplace=True)
+        det_df_copy.drop_duplicates(inplace=True)
+        det_df_copy.reset_index(drop=True, inplace=True)
+
+        # rerunning cell overlap section again to incorporate new detections
+        input_df = self.df_to_table_df_v2(input_df=input_df, det_df=det_df_copy)
 
         return input_df, det_df_copy
 
@@ -1672,8 +1748,6 @@ class PyMuPdf:
             # creating a dataframe of all detections made by the model : List ---> Dataframe
             self.lookup_detections_df = self.get_lookup_detection_frame(table_list, self.lookup_category_id_annotation_df)
 
-            self.z_model_det = self.lookup_detections_df.copy()
-
             # get undetected parts in a IMAGE and SAVE the Masked Image
             self.get_undetected_parts_img(image_name, table_list, page_num, save_img=result_save)
 
@@ -1684,16 +1758,11 @@ class PyMuPdf:
             # fill dataframe with overlap information of table and cells from Model
             dataframe = self.df_to_table_df_v2(input_df=dataframe, det_df=self.lookup_detections_df)
 
-            self.z_df_orig = dataframe.copy()
-
             img_buffer = io.BytesIO()
             im_resized.save(img_buffer, dpi=(600, 600), format="jpeg")
 
             # get undetected annotations of undetected_img and add update the detection dataframe in __init__
             dataframe, self.lookup_detections_df = self.get_undetected_parts_bbox(input_df=dataframe, det_df=self.lookup_detections_df, ref_frame=self.lookup_category_id_annotation_df)
-
-            self.z_und_model_det = self.lookup_detections_df.copy()
-            self.z_df = dataframe.copy()
 
             # Draw the detections updated by rule for undetected part
             self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num, name_of_file='_result_of_improved_bbox.jpeg', result_save=result_save)
@@ -1721,15 +1790,10 @@ class PyMuPdf:
                 self.draw_detetion_save_img(column_detection, image_name, page_num, name_of_file='_col_header.jpeg', result_save=result_save)
                 # b. Idetify headers in the dataset
                 dataframe = self.identify_headers(dataframe, column_detection)
-
-                self.test0 = dataframe.copy()                                          # BEFORE BLOCK CORRECTION
-
                 # c. Column min_max_creation --> new_col_lengths
                 dataframe, new_col_lengths, column_detection = self.column_creation(dataframe, column_detection)
                 dataframe = self.column_corr_final(dataframe, new_col_lengths)
                 dataframe['block_n'] = dataframe['col']
-
-                self.test1 = dataframe.copy()                                           # AFTER BLOCK CORRECTION
 
                 # deleting all texts where block value is still -1
                 # Get indexes where name column doesn't have value john
@@ -1737,7 +1801,7 @@ class PyMuPdf:
                 # Delete these row indexes from dataFrame
                 dataframe.drop(indexNames, inplace=True)
 
-                self.test2 = dataframe.copy()                                       # if block -1 deleted
+                self.test3 = dataframe.copy()
 
                 # STEP 4.a : Handling Multilines detected by model
                 orig_dataframe, dataframe = self.identify_cell_ids_with_multiline(src=dataframe)
@@ -1804,7 +1868,7 @@ class PyMuPdf:
                 return pixel_dic, dataframe, dataframe_write, df_raw
             else:
                 logger.error('*** TABLE not detected for Page number : {} *** '.format(page_num))
-        return pixel_dic, dataframe, pd.DataFrame(columns=['pageNo']), df_raw
+            return pixel_dic, dataframe, pd.DataFrame(columns=['pageNo']), df_raw
 
     def pdf_to_page_df_2(self, pdfpath, UID, page_list, result_save=False, save_result_dir='result'):
 
@@ -1878,15 +1942,12 @@ page_info, final_df, final_df_raw, excel_df, resp = obj.pdf_to_page_df_2(pdfpath
 
 
 """
-df = obj.z_df
-df0 = obj.z_df_orig
-df_model_det = obj.z_model_det
-df_und_det = obj.z_und_model_det
+df = obj.test3
 
-df0.to_json('df0.json')
+#df0.to_json('df0.json')
 df.to_json('df.json')
-df_model_det.to_json('df_model_det.json')
-df_und_det.to_json('df_und_det.json')
+#df_model_det.to_json('df_model_det.json')
+#df_und_det.to_json('df_und_det.json')
 
 """
 
