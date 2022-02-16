@@ -69,6 +69,7 @@ class PyMuPdf:
         self.column_det_threshold = 0.9
 
         self. column_det = None
+        self.excel_dir = r'/home/ubuntu/Downloads/efs/4i/table_cell_service/'
 
     def get_width(self, x0, x1):
         return int(x1-x0)
@@ -79,7 +80,7 @@ class PyMuPdf:
     def get_sourceid(self, row):
         return self.source
 
-    def draw_detetion_save_img(self, tbl_lst, img_p, page_num, name_of_file='_result.jpeg', result_save=False):
+    def draw_detetion_save_img(self, tbl_lst, img_p, page_num, name_of_file='_result.jpeg', color=(255, 0, 255), result_save=False):
         '''
         tbl_list is a standard format used across the table detection code
         tbl_list format : [ x1,y1, x2, y2, labl, conf]
@@ -98,14 +99,14 @@ class PyMuPdf:
                 x2 = det[2]
                 y2 = det[3]
                 label = det[4]
-                img = cv2.rectangle(img, (x1,y1), (x2,y2), color=(255,0, 255), thickness=2)
+                img = cv2.rectangle(img, (x1,y1), (x2,y2), color=color, thickness=2)
             if result_save:
                 cv2.imwrite(self.result_dir + str(page_num)+name_of_file, img)
 
         if isinstance(tbl_lst, pd.DataFrame):
             for i in range(len(tbl_lst)):
                 cv2.rectangle(img, (tbl_lst.loc[i, 'x'], tbl_lst.loc[i, 'y']), (tbl_lst.loc[i, 'x'] + tbl_lst.loc[i, 'w'], tbl_lst.loc[i, 'y'] + tbl_lst.loc[i, 'h']),
-                              color=(255, 0, 255), thickness=2)
+                              color=color, thickness=2)
             if result_save:
                 cv2.imwrite(self.result_dir + str(page_num) + name_of_file, img)
 
@@ -520,7 +521,33 @@ class PyMuPdf:
         # rerunning cell overlap section again to incorporate new detections
         input_df = self.df_to_table_df_v2(input_df=input_df, det_df=det_df_copy)
 
-        return input_df, det_df_copy
+        return input_df, det_df_copy, new_df
+
+    def height_correction_after_undetected_annotation(self, df, ids_to_work_on):
+        ids = list(ids_to_work_on.index)
+        for id in ids:
+            df.loc[id, 'c_y'] = df.loc[id, 'y']
+            df.loc[id, 'c_h'] = df.loc[id, 'h']
+
+        # now we prepape lookup_detections again
+        new_lookup = pd.DataFrame(columns=self.lookup_detections_df.columns)
+        df_lok_n = df[['c_x', 'c_y', 'c_w', 'c_h']]
+        df_lok_n = df_lok_n.drop_duplicates()
+        for ind in df_lok_n.index:
+            x = df_lok_n.loc[ind, 'c_x']
+            y = df_lok_n.loc[ind, 'c_y']
+            w = df_lok_n.loc[ind, 'c_w']
+            h = df_lok_n.loc[ind, 'c_h']
+            x2 = x+w
+            y2 = y+h
+            if x >0:
+                new_lookup = new_lookup.append({'x':x, 'y':y, 'w':w, 'h':h,'x2':x2, 'y2':y2, 'label': 'cell',
+                                                'conf':1, 'category_id':4, 'name':'cell', 'supercategory':'sentence'},
+                                               ignore_index=True)
+
+        df_tab = self.lookup_detections_df.loc[self.lookup_detections_df['supercategory']=='table']
+        new_lookup = new_lookup.append(df_tab, ignore_index=True)
+        return df, new_lookup
 
     def df_to_table_df_v2(self, input_df, det_df):
         '''
@@ -1042,36 +1069,134 @@ class PyMuPdf:
     def column_detection_intrim_pred(self, src_img, det_df, page_n):
 
         # identify unique tables detected by Table Model
-        uniq_table_id = list(det_df['table_id'].unique())
+
+        # uniq_table_id = list(det_df['table_id'].unique())                 # using Metadata as input det_df
+        uniq_table_id = list(det_df['category_id'].unique())                # using lookup_detection_df as det_df
+
         df_col_header = pd.DataFrame(columns=['x', 'y', 'w', 'h', 'x2', 'y2', 'name', 'conf'])
 
+        # Crop table area to feed to col detection model
         for e in uniq_table_id:
-            df_temp = det_df.loc[det_df['table_id'] == e]
-            df_temp = df_temp[['t_x', 't_y', 't_w', 't_h']]
-            df_temp.drop_duplicates(inplace=True)
+            if e in [0, 1, 2, 3]:                                           # check if supercategory is Table
+                df_temp = det_df.loc[det_df['category_id'] == e]
+                # df_temp = df_temp[['t_x', 't_y', 't_w', 't_h']]
+                df_temp = df_temp[['x', 'y', 'w', 'h']]
+                df_temp.drop_duplicates(inplace=True)
 
-            for ind in df_temp.index:
-                tx0 = df_temp.loc[ind, 't_x']
-                ty0 = df_temp.loc[ind, 't_y']
-                tx1 = df_temp.loc[ind, 't_w'] + tx0
-                ty1 = df_temp.loc[ind, 't_h'] + ty0
+                for ind in df_temp.index:
+                    tx0 = df_temp.loc[ind, 'x']
+                    ty0 = df_temp.loc[ind, 'y']
+                    tx1 = df_temp.loc[ind, 'w'] + tx0
+                    ty1 = df_temp.loc[ind, 'h'] + ty0
 
-                # crop image for table
-                crop_img = src_img[ty0:ty1, tx0:tx1]
-                # run column detection model
-                column_pred = self.get_table_v2(crop_img, page_n=page_n,object_names_list=['column'])
+                    # crop image for table
+                    crop_img = src_img[ty0:ty1, tx0:tx1]
+                    # run column detection model
+                    column_pred = self.get_table_v2(crop_img, page_n=page_n, object_names_list=['column'])
 
-                for colde in column_pred:
-                    dx1, dy1, dx2, dy2, cls_label, conf = colde
-                    if conf > 0.9:
-                        df_col_header = df_col_header.append(
-                            {'x': dx1 + tx0, 'y': dy1 + ty0, 'w': ((dx2 + tx0) - (dx1 + tx0)),
-                             'h': ((dy2 + ty0) - (dy1 + ty0)), 'x2': dx2 + tx0, 'y2': dy2 + ty0,
-                             'name': cls_label, 'conf': conf}, ignore_index=True)
+                    for colde in column_pred:
+                        dx1, dy1, dx2, dy2, cls_label, conf = colde
+                        # print(cls_label)
+                        if conf > 0.9:
+                            if cls_label in ['column']:
+                                # df_col_header = df_col_header.append({'x': dx1 + tx0, 'y': dy1 + ty0, 'w': ((dx2 + tx0) - (dx1 + tx0)), 'h': ((dy2 + ty0) - (dy1 + ty0)), 'x2': dx2 + tx0, 'y2': dy2 + ty0, 'name': cls_label, 'conf': conf}, ignore_index=True)
+                                df_col_header = df_col_header.append(
+                                    {'x': dx1 + tx0, 'y': ty0+10, 'w': ((dx2 + tx0) - (dx1 + tx0)),
+                                     'h': ty1-ty0-20 , 'x2': dx2 + tx0, 'y2': ty1-10,
+                                     'name': cls_label, 'conf': conf}, ignore_index=True)
+
+                            if cls_label in ['header']:
+                                # df_col_header = df_col_header.append({'x': dx1 + tx0, 'y': dy1 + ty0, 'w': ((dx2 + tx0) - (dx1 + tx0)), 'h': ((dy2 + ty0) - (dy1 + ty0)), 'x2': dx2 + tx0, 'y2': dy2 + ty0, 'name': cls_label, 'conf': conf}, ignore_index=True)
+                                df_col_header = df_col_header.append(
+                                    {'x': tx0, 'y': dy1 + ty0, 'w': tx1- tx0,
+                                     'h': ((dy2 + ty0) - (dy1 + ty0)), 'x2': tx1, 'y2': dy2 + ty0, 'name': cls_label,
+                                     'conf': conf}, ignore_index=True)
 
         df_col_header.sort_values(['x'], inplace=True)
         df_col_header = df_col_header.reset_index(drop=True)
         return df_col_header
+
+    def column_det_overlap_remove(self, col_head_det):
+        # Make sure columns dont overlap
+        col_head_det_ = col_head_det.copy()
+
+        header_only = col_head_det_.loc[col_head_det_['name']=='header']
+        col_only = col_head_det_.loc[col_head_det_['name']=='column']
+        col_only2 = col_head_det_.loc[col_head_det_['name'] == 'column']
+
+        col_only.sort_values(by=['x2', 'name'], inplace=True)
+        col_only.drop(col_only[col_only['name'] == 'header'].index, inplace=True)
+        col_only.reset_index(drop=True, inplace=True)
+
+        col_only2.sort_values(by=['x2', 'name'], inplace=True)
+        col_only2.drop(col_only2[col_only2['name'] == 'header'].index, inplace=True)
+        col_only2.reset_index(drop=True, inplace=True)
+
+        for i in range(1, len(col_only)):
+            current_x1 = col_only.loc[i, 'x']
+            previous_x2 = col_only.loc[i - 1, 'x2']
+            if previous_x2 > current_x1:
+                pixels_overlap = previous_x2 - current_x1
+                previous_new = previous_x2 - int(pixels_overlap / 2)
+                col_only2.loc[i, 'x'] = previous_new + 5
+                col_only2.loc[i - 1, 'x2'] = previous_new
+
+        header_only = header_only.append(col_only2, ignore_index=True)
+        return header_only
+
+    def column_remove_annotations_in_multi_columns(self, cell_det_frame, col_det_frame):
+        cell_det_new = cell_det_frame.copy()
+
+        for cell_det_ind in cell_det_frame.index:
+            label = cell_det_frame.loc[cell_det_ind, 'name']
+            if label in ['cell']:
+                cex = cell_det_frame.loc[cell_det_ind, 'x']
+                cey = cell_det_frame.loc[cell_det_ind, 'y']
+                cex2 = cell_det_frame.loc[cell_det_ind, 'x2']
+                cey2 = cell_det_frame.loc[cell_det_ind, 'y2']
+
+                lst = []
+                for col_det_ind in col_det_frame.index:
+                    label = col_det_frame.loc[col_det_ind, 'name']
+                    if label in ['column']:
+                        cox = col_det_frame.loc[col_det_ind, 'x']
+                        coy = col_det_frame.loc[col_det_ind, 'y']
+                        cox2 = col_det_frame.loc[col_det_ind, 'x2']
+                        coy2 = col_det_frame.loc[col_det_ind, 'y2']
+
+                        boo = self.isRectangleOverlap(R1=[cox, coy, cox2, coy2], R2=[cex, cey, cex2, cey2])
+                        if boo is True:
+                            lst.append([cox, coy, cox2, coy2])
+                if len(lst) > 1:
+                    cell_det_new.drop(cell_det_ind, inplace=True)
+                    # we now remove orignal detection and create new detections
+                    for col in lst:
+                        if col[0] < cex < col[2]:
+                            # new coordinates will be
+                            xmin = cex
+                            xmax = col[2] - 5
+                            ymin = cey
+                            ymax = cey2
+                            cell_det_new = cell_det_new.append(
+                                {'x': xmin, 'y': ymin, 'w': xmax - xmin, 'h': ymax - ymin,
+                                 'x2': xmax, 'y2': ymax, 'label': 'cell', 'conf': 2,
+                                 'category_id': 4, 'name': 'cell',
+                                 'supercategory': 'sentence'},
+                                ignore_index=True)
+                        if cex2 > col[0] and cex2 < col[2]:
+                            # new coordinates will be
+                            xmin = col[0] + 5
+                            xmax = cex2
+                            ymin = cey
+                            ymax = cey2
+                            cell_det_new = cell_det_new.append(
+                                {'x': xmin, 'y': ymin, 'w': xmax - xmin, 'h': ymax - ymin,
+                                 'x2': xmax, 'y2': ymax, 'label': 'cell', 'conf': 2,
+                                 'category_id': 4, 'name': 'cell',
+                                 'supercategory': 'sentence'},
+                                ignore_index=True)
+
+        return cell_det_new
 
     def identify_headers(self, src_df, col_det_df):
         '''
@@ -1550,7 +1675,7 @@ class PyMuPdf:
                 self.table_model = init_detector(config_table_detection, weights_path_table_detection, device='cpu')
 
             elif det.lower() in ['column', 'header']:
-                weights_path_column_detection = str(ROOT) + '/table_cell_config/epoch_50_column.pth'
+                weights_path_column_detection = str(ROOT) + '/table_cell_config/epoch_50_column_new.pth'
                 config_column_detection = str(ROOT) + '/mmdet/configs/cascade_rcnn/cascade_rcnn_r101_fpn_1x_coco_custom_column.py'
 
                 print('\n******  Looking for Column / Header Model Files at following path ****** ')
@@ -1758,12 +1883,25 @@ class PyMuPdf:
 
             # creating a dataframe of all detections made by the model : List ---> Dataframe
             self.lookup_detections_df = self.get_lookup_detection_frame(table_list, self.lookup_category_id_annotation_df)
+            self.lookup_detections_df = self.lookup_detections_df.drop_duplicates()
+            self.lookup_detections_df.reset_index(drop=True, inplace=True)
+            self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num, name_of_file='_bbox_detected.jpeg', result_save=result_save)
 
             # get undetected parts in a IMAGE and SAVE the Masked Image
-            self.get_undetected_parts_img(image_name, table_list, page_num, save_img=result_save)
+            # self.get_undetected_parts_img(image_name, table_list, page_num, save_img=result_save)
 
-            # Draw the detections identified by Model
-            # self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num, name_of_file='_result_of_bbox_detected.jpeg', result_save=result_save)
+            # Column Detection Model
+            self.column_detection = self.column_detection_intrim_pred(open_cv_image, self.lookup_detections_df, page_n=page_num)
+
+            # Overlap of columns Remove.
+            # Remember - Column santity is More important than Cell detection Model
+            self.column_detection = self.column_det_overlap_remove(self.column_detection)
+            self.draw_detetion_save_img(self.column_detection, image_name, page_num, name_of_file='_col_header.jpeg', result_save=result_save, color=(255, 0, 0))
+
+            # Removing all cell annotations that move in multiple columns
+            self.lookup_detections_df = self.column_remove_annotations_in_multi_columns(cell_det_frame=self.lookup_detections_df, col_det_frame= self.column_detection)
+            self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num, name_of_file='_bbox_detected2.jpeg',
+                                        result_save=result_save, color=(255, 0, 0))
 
             # -----------------------------------------------------------------------------------------
             # fill dataframe with overlap information of table and cells from Model
@@ -1773,7 +1911,10 @@ class PyMuPdf:
             im_resized.save(img_buffer, dpi=(600, 600), format="jpeg")
 
             # get undetected annotations of undetected_img and add update the detection dataframe in __init__
-            dataframe, self.lookup_detections_df = self.get_undetected_parts_bbox(input_df=dataframe, det_df=self.lookup_detections_df, ref_frame=self.lookup_category_id_annotation_df)
+            dataframe, self.lookup_detections_df, df_undet_cell_ref = self.get_undetected_parts_bbox(input_df=dataframe, det_df=self.lookup_detections_df, ref_frame=self.lookup_category_id_annotation_df)
+            dataframe, self.lookup_detections_df = self.height_correction_after_undetected_annotation(df=dataframe, ids_to_work_on=df_undet_cell_ref)
+            self.lookup_detections_df = self.lookup_detections_df.drop_duplicates()
+            self.lookup_detections_df.reset_index(drop=True, inplace=True)
             # Draw the detections updated by rule for undetected part
             self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num, name_of_file='_result_of_improved_bbox.jpeg', result_save=result_save)
 
@@ -1792,17 +1933,11 @@ class PyMuPdf:
                 dataframe = self.word_num_corr(src_df=dataframe)
 
                 #try:
-                # step 4 : new column detection model
-                # a. Prediction by Column/ Header detection Model
-                column_detection = self.column_detection_intrim_pred(open_cv_image, dataframe, page_n=page_num)
-                self.column_det = column_detection.copy()
-                # Draw the detections updated by rule for undetected part
-                self.draw_detetion_save_img(column_detection, image_name, page_num, name_of_file='_col_header.jpeg', result_save=result_save)
+                # step 4 : Column Model ran Above
                 # b. Idetify headers in the dataset
-                dataframe = self.identify_headers(dataframe, column_detection)
-
+                dataframe = self.identify_headers(dataframe, self.column_detection)
                 # c. Column min_max_creation --> new_col_lengths
-                dataframe, new_col_lengths, column_detection = self.column_creation(dataframe, column_detection)
+                dataframe, new_col_lengths, column_detection = self.column_creation(dataframe, self.column_detection)
                 dataframe = self.column_corr_final(dataframe, new_col_lengths)
                 dataframe['block_n'] = dataframe['col']
 
@@ -1826,7 +1961,11 @@ class PyMuPdf:
                 # Handling Multiline with rules
                 dataframe_write = self.handle_multiline_with_rule(df=dataframe_write)
                 # Writing this updated frame to excel again
-                self.write_excel_after_multiline_handling(src_frame=dataframe_write, save_path=self.result_dir + 'pdf_data_excel.xlsx', read_path=self.result_dir + 'pdf_data_excel.xlsx', page_no=page_num, save_excel=result_save)
+                self.write_excel_after_multiline_handling(src_frame=dataframe_write, save_path=self.excel_dir_ + 'pdf_data_excel.xlsx', read_path=self.excel_dir_ + 'pdf_data_excel.xlsx', page_no=page_num, save_excel=result_save)
+                self.write_excel_after_multiline_handling(src_frame=dataframe_write,
+                                                          save_path=self.result_dir + 'pdf_data_excel.xlsx',
+                                                          read_path=self.result_dir + 'pdf_data_excel.xlsx',
+                                                          page_no=page_num, save_excel=result_save)
 
                 # writing result to json file for testing
                 # self.lookup_detections_df.to_json(self.result_dir + str(page_num) + '_detectionFrame.json')
@@ -1879,7 +2018,9 @@ class PyMuPdf:
 
         # creating directory to save Results
         self.result_dir = os.getcwd() + '/' + save_result_dir + '/'
+        self.excel_dir_ = self.excel_dir + '/' + save_result_dir + '/'
         os.makedirs(self.result_dir, mode=0o777, exist_ok=True)
+        os.makedirs(self.excel_dir_, mode=0o777, exist_ok=True)
         print('\n*** NOTE : Results will be stored in location : ', self.result_dir, '\n')
         logger.info('\t*** NOTE : Results will be stored in location : {} *********'.format(self.result_dir))
 
