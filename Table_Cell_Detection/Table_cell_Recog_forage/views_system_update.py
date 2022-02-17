@@ -63,8 +63,7 @@ class PyMuPdf:
         self.column_model = None
         self.column_det_threshold = 0.9
 
-        self.excel_dir = r'/home/ubuntu/Downloads/efs/4i/table_cell_service/pdf_to_excel_output/'
-
+        self.excel_dir = r'/home/ubuntu/Downloads/efs/4i/table_cell_service/'
 
     def get_width(self, x0, x1):
         return int(x1-x0)
@@ -495,12 +494,14 @@ class PyMuPdf:
                         xmax = max(max(undet_x2, det_x2), xmax)
                         flag = 1
             if flag > 0:
+                # overlap with Exsisting Detection was found
                 undet_frame = undet_frame.append(
                     {'x': xmin, 'y': undet_y, 'w': xmax - xmin, 'h': undet_h, 'x2': xmax, 'y2': undet_y + undet_h,
                      'label': 'cell', 'conf': 2, 'category_id': 4, 'name': 'cell', 'supercategory': 'sentence'},
                     ignore_index=True)
                 undet_frame.drop_duplicates(inplace=True)
             if flag < 0:
+                # overlap with any previous detection was not found and hence Meta information is updated
                 undet_frame = undet_frame.append(
                     {'x': undet_x, 'y': undet_y, 'w': undet_w, 'h': undet_h, 'x2': undet_x2, 'y2': undet_y + undet_h,
                      'label': 'cell', 'conf': 2, 'category_id': 4, 'name': 'cell', 'supercategory': 'sentence'},
@@ -516,9 +517,17 @@ class PyMuPdf:
         # rerunning cell overlap section again to incorporate new detections
         input_df = self.df_to_table_df_v2(input_df=input_df, det_df=det_df_copy)
 
+        # NOTE :
+        # new_df : is Meta info dataframe , which has information of all words Inside Table but Cell was not detected
+        # det_df_copy : detection information of cells inside the table Only + undetected annotations created
+
+
         return input_df, det_df_copy, new_df
 
     def height_correction_after_undetected_annotation(self, df, ids_to_work_on):
+        '''
+        Here we make sure that Annotations that were manually created have a strict height of the word only
+        '''
         ids = list(ids_to_work_on.index)
         for id in ids:
             df.loc[id, 'c_y'] = df.loc[id, 'y']
@@ -571,7 +580,7 @@ class PyMuPdf:
                 v_x2 = v_x + v_w
                 v_y2 = v_y + v_h
                 if label not in ['semi_grided_table', 'grided_table', 'gridless_table', 'key_value']:
-                    if self.isRectangleOverlap([v_x, v_y, v_x2, v_y2], [d_x, d_y, d_x2, d_y2]):
+                    if self.isRectangleOverlap([v_x, v_y+5, v_x2, v_y2-5], [d_x, d_y, d_x2, d_y2]):
                         df0.loc[j, 'is_in_cell'] = 1
                         df0.loc[j, 'cell_id'] = i
                         df0.loc[j, 'cell_type'] = label
@@ -579,7 +588,7 @@ class PyMuPdf:
                         df0.loc[j, 'c_y'] = d_y
                         df0.loc[j, 'c_w'] = d_x2 - d_x
                         df0.loc[j, 'c_h'] = d_y2 - d_y
-                else:
+                elif label in ['semi_grided_table', 'grided_table', 'gridless_table', 'key_value']:
                     if self.isRectangleOverlap([v_x, v_y, v_x2, v_y2], [d_x, d_y, d_x2, d_y2]):
                         df0.loc[j, 'is_in_table'] = 1
                         df0.loc[j, 'table_id'] = i
@@ -1198,10 +1207,13 @@ class PyMuPdf:
 
     def cells_remove_overlap_annotations(self, col_det_df, lookup_det):
 
+        # using column detection we get anootations of column only
         col_only = col_det_df.loc[col_det_df['name'] == 'column']
         col_only.sort_values(by=['x'], inplace=True)
         col_only.reset_index(drop=True, inplace=True)
 
+        # in Lookup detection frame we add a column called 'col' = -1
+        # and identify which column the detection will belong to
         lookup_det['col'] = -1  # --------> Lookup Detections DF
         for i in range(len(lookup_det)):
             name = lookup_det.loc[i, 'supercategory']
@@ -1219,6 +1231,7 @@ class PyMuPdf:
         cell_det = cell_det.loc[lookup_det['col'] > -1]
 
         unique_col = cell_det['col'].unique()
+        # considering all detections where column is greater that  -1
         for ucol in unique_col:
             if ucol >= 0:
                 tmp = cell_det.loc[cell_det['col'] == ucol]
@@ -1227,6 +1240,8 @@ class PyMuPdf:
                 for i in range(1, len(tmp)):
                     current_y1 = tmp.loc[i, 'y']
                     previous_y2 = tmp.loc[i - 1, 'y2']
+
+
 
                     cur_ind = tmp.loc[i, 'index']
                     pre_ind = tmp.loc[i - 1, 'index']
@@ -1844,6 +1859,47 @@ class PyMuPdf:
             column_pred = self.restructure_mmdet_predictions(column_pred, model=self.column_model)
             return column_pred
 
+    def metadata_correcction_y_coordnates(self, df):
+        z = df.copy()
+        z.sort_values(by=['y'], inplace=True)
+        z.reset_index(drop=False, inplace=True)
+
+        for i in range(1, len(z)):
+            curr_y = z.loc[i, 'y']
+            pre_y = z.loc[i - 1, 'y']
+            if curr_y == pre_y:
+                pass
+            else:
+                diff = curr_y - pre_y
+                if diff > 15:
+                    pass
+                else:
+                    z.loc[i - 1, 'y'] = max(curr_y, pre_y)
+                    z.loc[i, 'y'] = max(curr_y, pre_y)
+                    z.loc[i - 1, 'y'] = max(curr_y, pre_y)
+
+        z.sort_values(by=['index'], inplace=True)
+        z.set_index('index', drop=True, inplace=True)
+        return z
+
+    def lookupdetections_y1_y2_same_value_remove(self, lookupdet):
+        z1 = lookupdet.copy()
+        z1 = z1.drop_duplicates()
+        z1.sort_values(by=['x', 'y'], inplace=True)
+        z1.reset_index(drop=True, inplace=True)
+        z3 = z1.copy()
+        for i in range(1, len(z1)):
+            curr_y = z1.loc[i, 'y']
+            pre_y2 = z1.loc[i - 1, 'y2']
+            if curr_y == pre_y2:
+                print('----', i)
+                z3.loc[i, 'y'] = curr_y + 2
+                z3.loc[i - 1, 'y2'] = pre_y2 - 2
+
+                z3.loc[i, 'h'] = z1.loc[i, 'y2'] - curr_y + 2
+                z3.loc[i - 1, 'h'] = (pre_y2 - 2) - z1.loc[i - 1, 'y']
+        return z3
+
     def pdf_to_page_df_mypypdf_intrim(self, page_num, result_save):
         '''
         This function extrats information for each page
@@ -1914,7 +1970,9 @@ class PyMuPdf:
             dataframe['header'] = -1
             dataframe['col'] = -1
 
-            df_raw = dataframe.copy()
+            # correcting Meta information in raw frame.
+            dataframe = self.metadata_correcction_y_coordnates(dataframe)
+            self.df_raw = dataframe.copy()
 
             # ---------------------------------- DEEP LEARNING MODEL FOR DETECTION ---------------------------------
             # DL Model Run   ----- NOTE : table_list has following format : [x0, y0, x1, y1, label, conf]
@@ -1940,27 +1998,35 @@ class PyMuPdf:
 
             # Removing all cell annotations that move in multiple columns
             self.lookup_detections_df = self.column_remove_annotations_in_multi_columns(cell_det_frame=self.lookup_detections_df, col_det_frame= self.column_detection)
-            self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num, name_of_file='_bbox_detected2.jpeg', result_save=result_save, color=(255, 0, 0))
+            self.draw_detetion_save_img(self.lookup_detections_df, self.result_dir + str(page_num) + '_bbox_detected.jpeg', page_num, name_of_file='_bbox_detected2.jpeg', result_save=result_save, color=(255, 0, 0))
 
             # -----------------------------------------------------------------------------------------
             # fill dataframe with overlap information of table and cells from Model
             dataframe = self.df_to_table_df_v2(input_df=dataframe, det_df=self.lookup_detections_df)
+
+            self.test_df = dataframe.copy()
+            self.test_lokup = self.lookup_detections_df.copy()
 
             img_buffer = io.BytesIO()
             im_resized.save(img_buffer, dpi=(600, 600), format="jpeg")
 
             # get undetected annotations of undetected_img and add update the detection dataframe in __init__
             dataframe, self.lookup_detections_df, df_undet_cell_ref = self.get_undetected_parts_bbox(input_df=dataframe, det_df=self.lookup_detections_df, ref_frame=self.lookup_category_id_annotation_df)
+
             dataframe, self.lookup_detections_df = self.height_correction_after_undetected_annotation(df=dataframe, ids_to_work_on=df_undet_cell_ref)
+
             self.lookup_detections_df = self.lookup_detections_df.drop_duplicates()
             self.lookup_detections_df.reset_index(drop=True, inplace=True)
-            self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num, name_of_file='_improved_bbox.jpeg', result_save=result_save)
+            self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num, name_of_file='_improved_bbox.jpeg', result_save=result_save, color=(255, 0, 0))
+
+            self.test_df2 = dataframe.copy()
 
             self.lookup_detections_df = self.cells_remove_overlap_annotations(col_det_df=self.column_detection, lookup_det=self.lookup_detections_df)
+            self.lookup_detections_df = self.lookupdetections_y1_y2_same_value_remove(lookupdet=self.lookup_detections_df)
             self.lookup_detections_df = self.lookup_detections_df.drop_duplicates()
             self.lookup_detections_df.reset_index(drop=True, inplace=True)
             # Draw the detections updated by rule for undetected part
-            self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num, name_of_file='_improved_bbox2.jpeg', result_save=result_save)
+            self.draw_detetion_save_img(self.lookup_detections_df,  self.result_dir + str(page_num) + '_improved_bbox.jpeg', page_num, name_of_file='_improved_bbox2.jpeg', result_save=result_save, color=(150, 255, 0))
 
             # fill dataframe with overlap information of table and cells AGAIN
             dataframe = self.df_to_table_df_v2(input_df=dataframe, det_df=self.lookup_detections_df)
@@ -1971,7 +2037,7 @@ class PyMuPdf:
             dataframe = dataframe.loc[(dataframe['is_in_table'] == 1)]
             self.test = dataframe.copy()
 
-            #'''
+
             # run if table was detected and above frame is not empty
             if len(dataframe) > 0:
                 #pass
@@ -2019,45 +2085,12 @@ class PyMuPdf:
                 # self.lookup_detections_df.to_json(self.result_dir + str(page_num) + '_detectionFrame.json')
                 dataframe_write['page_no'] = page_num
                 # dataframe_write.to_json(self.result_dir + str(page_num) + '_df_excelFrame.json')
-                #"""
-                """
-                except:
-                    logger.info(' Inside Exception Entering to old method for block correction}')
-                    logger.info(' for page number \t\t {}'.format(page_num))
-                    logger.info(' for page number \t\t {}'.format(self.result_dir))
-                    # STEP 4 : Column identification and correction of Block values / Column values
-                    dataframe = self.block_corr_final(src_df=dataframe)
-                    # STEP 4.a : Handling Multilines detected by model
-                    orig_dataframe, dataframe = self.identify_cell_ids_with_multiline(src=dataframe)
-                    # STEP 4.b : Handling Multiline part2
-                    dataframe = self.multiline_correction_final(dataframe)
-    
-                    # STEP 5 : Write result to EXCEL File
-                    dataframe = dataframe.sort_values(['cell_id', 'c_x', 'c_y'])
-                    dataframe.reset_index(drop=True, inplace=True)
-                    self.test = dataframe.copy()
-                    # dataframe_write is dataframe which is near perfect excel format
-                    dataframe_write = self.writing_formated_table_to_excel(src_frame=dataframe,
-                                                                           save_path=self.result_dir + 'pdf_data_excel.xlsx',
-                                                                           read_path=self.result_dir + 'pdf_data_excel.xlsx',
-                                                                           page_no=page_num, save_excel=result_save)
-                    # Handling Multiline with rules
-                    dataframe_write = self.handle_multiline_with_rule(df=dataframe_write)
-                    # Writing this updated frame to excel again
-                    self.write_excel_after_multiline_handling(src_frame=dataframe_write,
-                                                              save_path=self.result_dir + 'pdf_data_excel.xlsx',
-                                                              read_path=self.result_dir + 'pdf_data_excel.xlsx',
-                                                              page_no=page_num, save_excel=result_save)
-    
-                    # writing result to json file for testing
-                    # self.lookup_detections_df.to_json(self.result_dir + str(page_num) + '_detectionFrame.json')
-                    dataframe_write['page_no'] = page_num
-                    # dataframe_write.to_json(self.result_dir + str(page_num) + '_df_excelFrame.json')
-                    """
-                return pixel_dic, dataframe, dataframe_write, df_raw
+
+                return pixel_dic, dataframe, dataframe_write, self.df_raw
             else:
                 logger.error('*** TABLE not detected for Page number : {} *** '.format(page_num))
-            return pixel_dic, dataframe, pd.DataFrame(columns=['pageNo']), df_raw
+
+            return pixel_dic, dataframe, pd.DataFrame(columns=['pageNo']), self.df_raw
 
     def pdf_to_page_df_2(self, pdfpath, UID, page_list, result_save=False, save_result_dir='result'):
 
@@ -2120,12 +2153,13 @@ class PyMuPdf:
 
 
 pdf_file_path = r'D:\ForageAI\tables_project\table_cell\2020141.pdf'    # [54,55,56,57,41,42,43,44,62,24,37,38,39,40,58,59,60,61,45,49]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\2020703.pdf'
+pdf_file_path = r'D:\ForageAI\tables_project\table_cell\202017.pdf'
 pdf_file_path = pdf_file_path.replace("\\", "/")
 resul_dir = pdf_file_path.split('/')[-1].split('.')[0]
 obj = PyMuPdf()
 page_info, final_df, final_df_raw, excel_df, resp = obj.pdf_to_page_df_2(pdfpath=pdf_file_path, UID=resul_dir,
-                                                                   page_list=[53],
+                                                                   page_list=[41],
                                                                    result_save=True,
                                                                    save_result_dir='pdf_to_excel_output/'+resul_dir)
+
 
