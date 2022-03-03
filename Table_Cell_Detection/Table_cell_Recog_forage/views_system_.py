@@ -17,43 +17,67 @@ import PIL.Image as Image
 from openpyxl.workbook import Workbook
 from openpyxl import load_workbook
 
-''' ------------------------------------   using YOLO v5    ------------------------- '''
-# from yolov5.yolo_detection import Yolov5Inference
+import pyodbc as pyodbc
+
+# ------------- SQL Database connection -----------------
+
+connect_string = 'DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};PORT=1443;DATABASE={database};UID={username};PWD={password}'.format(**details)
+connection = pyodbc.connect(connect_string,unicode_results = True)
+# Initialise the Cursor
+cursor = connection.cursor()
+
+#--------------------------------------------------------------
+
+warnings.filterwarnings('ignore')
+
+'''------------------------------------ Setting Logger --------------------------------'''
+
+logging.basicConfig(filename="LogFile_table_cell.log",
+                    format='%(asctime)s %(message)s'
+                    )
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 ''' ------------------------------------ using MMCV as model --------------------------- '''
-import mmcv
 from mmdet.apis import init_detector, inference_detector
-
-logger = logging.getLogger(__name__)
-warnings.filterwarnings('ignore')
 
 try:
     FILE = Path(__file__).resolve()
     ROOT = FILE.parents[0]  # YOLOv5 root directory
-    ROOT = ROOT.replace("\\", "/")
+    ROOT = ROOT.replace("\\", "/") + '/'
 except:
     ROOT = os.getcwd()
-    ROOT = ROOT.replace("\\", "/")
+    ROOT = ROOT.replace("\\", "/") + '/'
 
+logger.info('\n\n\t\t--------------------- Root Directory is : {} -------------------\t\n'.format(ROOT))
 
 class PyMuPdf:
+
     def __init__(self):
-        self.logger = logging.getLogger(__name__)
+
         self.doc = None
         self.source = None
         self.result_dir = None
         self.lookup_category_id_annotation_df = pd.DataFrame.from_dict(
-            {'category_id': [0, 1, 2, 3, 4, 5],
-             'name': ['semi_grided_table', 'grided_table', 'gridless_table', 'key_value', 'cell', 'special_cell'],
-             'supercategory': ['table', 'table', 'table', 'table', 'sentence', 'sentence']
+            {'category_id': [0, 1, 2, 3, 4, 5, 6],
+             'name': ['semi_grided_table', 'grided_table', 'gridless_table', 'key_value', 'cell', 'special_cell', 'spanning_cell'],
+             'supercategory': ['table', 'table', 'table', 'table', 'sentence', 'sentence', 'sentence']
              })
 
         self.lookup_detections_df = None
+        self.column_detection = None
 
         self.cell_model = None
         self.cell_det_threshold = 0.8
         self.table_model = None
         self.table_det_threshold = 0.9
+        self.column_model = None
+        self.column_det_threshold = 0.9
+
+        self.excel_dir = r'/home/ubuntu/Downloads/efs/4i/table_cell_service/'
+
+        self.db_status = None
+        #self.db_statement = "UPDATE documentspy SET status='"+self.db_status+"' where documentid="+str(self.source)
 
     def get_width(self, x0, x1):
         return int(x1-x0)
@@ -64,7 +88,7 @@ class PyMuPdf:
     def get_sourceid(self, row):
         return self.source
 
-    def draw_detetion_save_img(self, tbl_lst, img_p, page_num, name_of_file='_result.jpeg'):
+    def draw_detetion_save_img(self, tbl_lst, img_p, page_num, name_of_file='_result.jpeg', color=(255, 0, 255), result_save=False):
         '''
         tbl_list is a standard format used across the table detection code
         tbl_list format : [ x1,y1, x2, y2, labl, conf]
@@ -72,7 +96,10 @@ class PyMuPdf:
         or it could be a dataframe having all detections stored
         '''
 
-        img = cv2.imread(img_p)
+        if isinstance(img_p, np.ndarray):
+            img = img_p.copy()
+        else:
+            img = cv2.imread(img_p)
         if isinstance(tbl_lst, list):
             for det in tbl_lst:
                 x1 = det[0]
@@ -80,26 +107,41 @@ class PyMuPdf:
                 x2 = det[2]
                 y2 = det[3]
                 label = det[4]
-                img = cv2.rectangle(img, (x1,y1), (x2,y2), color=(255,0, 255), thickness=2)
-            cv2.imwrite(self.result_dir + str(page_num)+name_of_file, img)
+                img = cv2.rectangle(img, (x1,y1), (x2,y2), color=color, thickness=2)
+            if result_save:
+                cv2.imwrite(self.result_dir + str(page_num)+name_of_file, img)
 
         if isinstance(tbl_lst, pd.DataFrame):
             for i in range(len(tbl_lst)):
                 cv2.rectangle(img, (tbl_lst.loc[i, 'x'], tbl_lst.loc[i, 'y']), (tbl_lst.loc[i, 'x'] + tbl_lst.loc[i, 'w'], tbl_lst.loc[i, 'y'] + tbl_lst.loc[i, 'h']),
-                              color=(255, 0, 255), thickness=2)
-            cv2.imwrite(self.result_dir + str(page_num) + name_of_file, img)
-        return tbl_lst
+                              color=color, thickness=2)
+            if result_save:
+                cv2.imwrite(self.result_dir + str(page_num) + name_of_file, img)
 
     def get_lookup_detection_frame(self, det_lst, ref_frame):
-        df = pd.DataFrame(columns=['x', 'y', 'w', 'h', 'x2', 'y2', 'label'])
+        '''
+        This Function creates a dataframe of detections made by the model
+        Input:
+                det_lst         :   List of detections in table_list format
+                ref_frame       :   self.lookup_category_id_annotation_df
+        Output:
+                df_             :   Dataframe of table_list Detection
+        '''
+        df = pd.DataFrame(columns=['id','x', 'y', 'w', 'h', 'x2', 'y2', 'label'])
         for d in det_lst:
             x1, y1, x2, y2, label, conf = d
-            df = df.append({'x': x1, 'y': y1, 'w': x2 - x1, 'h': y2 - y1, 'x2': x2, 'y2': y2, 'label': label}, ignore_index=True)
-            df = df.sort_values(['y', 'x'], ascending=True)
+            if conf> 0.8:
+                df = df.append({'x': x1, 'y': y1, 'w': x2 - x1, 'h': y2 - y1, 'x2': x2, 'y2': y2, 'label': label, 'conf':conf}, ignore_index=True)
+                df = df.sort_values(['y', 'x'], ascending=True)
 
         df_ = pd.merge(df, ref_frame, how='left', left_on='label', right_on='name')
+        df_ = df_.drop_duplicates()
+        df_.reset_index(drop=True, inplace=True)
+        df_['id'] = df_.index
 
-        return df_
+        # overlap information check between various cells in detetion frame
+        df_2 = self.overlap_of_detections_check(df_)
+        return df_2
 
     def get_undetected_parts_img(self, img_p, det_lst, page_num, save_img=True):
         '''
@@ -205,7 +247,7 @@ class PyMuPdf:
 
         return input_df, final_
 
-    def get_undetected_parts_bbox(self, input_df, det_df, ref_frame):
+    def get_undetected_parts_bbox_v2_old(self, input_df, det_df, ref_frame):
         '''
         this function identifies the undetected cells and their coordinates.
         These new bbox cordinates are updated to model detetion output.
@@ -418,6 +460,145 @@ class PyMuPdf:
 
         return input_df, det_df_copy
 
+    def get_undetected_parts_bbox(self, input_df, det_df):
+
+        det_df_copy = det_df.copy()
+        det_tab = det_df.loc[det_df['supercategory'] == 'table']
+        det_sen = det_df.loc[det_df['supercategory'] == 'sentence']
+
+        # removing all detections outside table
+        # if sentence detections overlap with table coordinates we keep it else Removed
+        for sind in det_sen.index:
+            to_drop = True
+            R1 = [det_sen.loc[sind, 'x'], det_sen.loc[sind, 'y'], det_sen.loc[sind, 'x2'], det_sen.loc[sind, 'y2']]
+            for tind in det_tab.index:
+                R2 = [det_tab.loc[tind, 'x'], det_tab.loc[tind, 'y'], det_tab.loc[tind, 'x2'], det_tab.loc[tind, 'y2']]
+                boo,_,_ = self.isRectangleOverlap(R1, R2)
+                if boo is True:
+                    # if overlap is true we do not want to drop this index , hence
+                    to_drop = False
+            if to_drop is True:
+                det_df_copy.drop(sind, inplace=True)
+
+        # det_df_copy  --->  Cells detected by Model inside Table Frame
+        det_df_copy.drop_duplicates(inplace=True)
+        det_df_copy.reset_index(drop=True, inplace=True)
+
+        # undetected_text identified using Metadata
+        new_df = input_df[(input_df['is_in_cell'] == 0) & (input_df['is_in_table'] == 1)]
+        # creating an empty dataframe
+        undet_frame = pd.DataFrame(columns=['id','x', 'y', 'w', 'h', 'x2', 'y2', 'label', 'conf', 'category_id', 'name', 'supercategory', 'overlap'])
+
+        # ---------------------- now we find overlap with exsisting Detections -------------
+
+        # Extract metadata infor of words that did not get detected and find X-overlaps
+        ctr = len(det_df)+2
+        for i in new_df.index:
+            undet_x = new_df.loc[i, 'x']
+            undet_w = new_df.loc[i, 'w']
+            undet_x2 = undet_x + undet_w
+            undet_y = new_df.loc[i, 'y']
+            undet_h = new_df.loc[i, 'h']
+
+            xmin = 1000000
+            xmax = 0
+            flag = -1
+            for j in det_df_copy.index:
+                det_x = det_df_copy.loc[j, 'x']
+                det_x2 = det_df_copy.loc[j, 'x2']
+                det_w = det_df_copy.loc[j, 'w']
+                name = det_df_copy.loc[j, 'supercategory']
+                if name not in ['table']:
+                    boo = self.is_overlap_check_along_rows(undet_x, undet_x2, undet_w, det_x, det_x2, det_w)
+                    if boo:
+                        _, per = boo
+                        xmin = min(xmin, min(undet_x, det_x))
+                        xmax = max(max(undet_x2, det_x2), xmax)
+                        flag = 1
+            if flag > 0:
+                # overlap with Exsisting Detection was found
+                undet_frame = undet_frame.append(
+                    {'id':ctr,'x': xmin, 'y': undet_y, 'w': xmax - xmin, 'h': undet_h, 'x2': xmax, 'y2': undet_y + undet_h,
+                     'label': 'cell', 'conf': 2, 'category_id': 4, 'name': 'cell', 'supercategory': 'sentence'},
+                    ignore_index=True)
+                undet_frame.drop_duplicates(inplace=True)
+
+            if flag < 0:
+                # overlap with any previous detection was not found and hence Meta information is updated
+                undet_frame = undet_frame.append(
+                    {'id':ctr,'x': undet_x, 'y': undet_y, 'w': undet_w, 'h': undet_h, 'x2': undet_x2, 'y2': undet_y + undet_h,
+                     'label': 'cell', 'conf': 2, 'category_id': 4, 'name': 'cell', 'supercategory': 'sentence'},
+                    ignore_index=True)
+                undet_frame.drop_duplicates(inplace=True)
+
+        # we now use our function to see if there is any overlap between
+        # the undetected detections formed
+        undet_frame.drop_duplicates(inplace=True)
+        undet_frame.reset_index(drop=True, inplace=True)
+        undet_frame['id'] = undet_frame.index + ctr
+        undet_frame_ = self.overlap_of_detections_check(undet_frame)
+        undet_frame_2 = self.overlap_det_removal_after_check(undet_frame_, id_ctr=undet_frame.loc[len(undet_frame)-1, 'id']+1)
+        undet_frame_2['id'] = -1
+        undet_frame_2.drop_duplicates(inplace=True)
+        undet_frame_2.reset_index(drop=True, inplace=True)
+        undet_frame_2['id'] = undet_frame_2.index + ctr
+
+        # Merging the unde frame with our prev detections
+        det_df_copy = det_df_copy.append(undet_frame_2, ignore_index=True)
+        det_df_copy.drop_duplicates(inplace=True)
+        det_df_copy.reset_index(drop=True, inplace=True)
+        det_df_copy['id'] = det_df_copy.index
+
+        # again performing the possibl overlap between undetected anootations made + the detections by model
+        det_df_copy = self.overlap_of_detections_check(det_df_copy)
+        det_df_copy_ = self.overlap_det_removal_after_check(det_df_copy,id_ctr=det_df_copy.loc[len(det_df_copy) - 1, 'id'] + 1)
+
+        det_df_copy_.sort_values(by=['y', 'x'], inplace=True)
+        det_df_copy_.drop_duplicates(inplace=True)
+        det_df_copy_.reset_index(drop=True, inplace=True)
+
+        # rerunning cell overlap section again to incorporate new detections
+        input_df = self.df_to_table_df_v2(input_df=input_df, det_df=det_df_copy_)
+
+        # NOTE :
+        # new_df : is Meta info dataframe , which has information of all words Inside Table but Cell was not detected
+        # det_df_copy : detection information of cells inside the table Only + undetected annotations created
+        return input_df, det_df_copy_, new_df
+
+    def height_correction_after_undetected_annotation(self, df, ids_to_work_on):
+        '''
+        Here we make sure that Annotations that were manually created have a strict height of the word only
+        '''
+        ids = list(ids_to_work_on.index)
+        for id in ids:
+            df.loc[id, 'c_y'] = df.loc[id, 'y']
+            df.loc[id, 'c_h'] = df.loc[id, 'h']
+
+        # now we prepape lookup_detections again
+        new_lookup = pd.DataFrame(columns=self.lookup_detections_df.columns)
+        df_lok_n = df[['c_x', 'c_y', 'c_w', 'c_h']]
+        df_lok_n = df_lok_n.drop_duplicates()
+        for ind in df_lok_n.index:
+            x = df_lok_n.loc[ind, 'c_x']
+            y = df_lok_n.loc[ind, 'c_y']
+            w = df_lok_n.loc[ind, 'c_w']
+            h = df_lok_n.loc[ind, 'c_h']
+            x2 = x+w
+            y2 = y+h
+            if x > 0:
+                new_lookup = new_lookup.append({'x':x, 'y':y, 'w':w, 'h':h,'x2':x2, 'y2':y2, 'label': 'cell',
+                                                'conf':1, 'category_id':4, 'name':'cell', 'supercategory':'sentence'},
+                                               ignore_index=True)
+
+        df_tab = self.lookup_detections_df.loc[self.lookup_detections_df['supercategory']=='table']
+        new_lookup = new_lookup.append(df_tab, ignore_index=True)
+
+        # restting new
+        new_lookup = new_lookup.drop_duplicates()
+        new_lookup.reset_index(drop=True, inplace=True)
+
+        return df, new_lookup
+
     def df_to_table_df_v2(self, input_df, det_df):
         '''
         this function takes as input :
@@ -428,66 +609,98 @@ class PyMuPdf:
         Return :
             df0             : updated input_df with overlap information of table or cell
         '''
-        df0 = input_df
-        for i in range(len(det_df)):
-            d_x = det_df.loc[i, 'x']
-            d_y = det_df.loc[i, 'y']
-            d_x2 = det_df.loc[i, 'x2']
-            d_y2 = det_df.loc[i, 'y2']
-            d_w = det_df.loc[i, 'w']
-            d_h = det_df.loc[i, 'h']
-            label = det_df.loc[i, 'label']
-            for j in range(len(df0)):
-                v_x = df0.loc[j, 'x']
-                v_y = df0.loc[j, 'y']
-                v_w = df0.loc[j, 'w']
-                v_h = df0.loc[j, 'h']
-                v_x2 = v_x + v_w
-                v_y2 = v_y + v_h
-                if label not in ['semi_grided_table', 'grided_table', 'gridless_table', 'key_value']:
-                    if self.isRectangleOverlap([v_x, v_y, v_x2, v_y2], [d_x, d_y, d_x2, d_y2]):
+        df0 = input_df.copy()
+        for j in range(len(input_df)):
+            v_x = df0.loc[j, 'x']
+            v_y = df0.loc[j, 'y']
+            v_w = df0.loc[j, 'w']
+            v_h = df0.loc[j, 'h']
+            v_x2 = v_x + v_w
+            v_y2 = v_y + v_h
+            overlap_index = []
+
+            for i in range(len(det_df)):
+                d_x = det_df.loc[i, 'x']
+                d_y = det_df.loc[i, 'y']
+                d_x2 = det_df.loc[i, 'x2']
+                d_y2 = det_df.loc[i, 'y2']
+                label = det_df.loc[i, 'label']
+                cell_id = det_df.loc[i, 'id']
+
+                if label not in ['semi_grided_table', 'grided_table',
+                                 'gridless_table', 'key_value']:
+                    boo, area, perc = self.isRectangleOverlap([v_x, v_y, v_x2, v_y2], [d_x, d_y, d_x2, d_y2])
+                    if boo == True and perc > 0.4:
+                        overlap_index.append([i, area, perc])
                         df0.loc[j, 'is_in_cell'] = 1
-                        df0.loc[j, 'cell_id'] = i
+                        df0.loc[j, 'cell_id'] = cell_id
                         df0.loc[j, 'cell_type'] = label
                         df0.loc[j, 'c_x'] = d_x
                         df0.loc[j, 'c_y'] = d_y
                         df0.loc[j, 'c_w'] = d_x2 - d_x
                         df0.loc[j, 'c_h'] = d_y2 - d_y
-                else:
-                    if self.isRectangleOverlap([v_x, v_y, v_x2, v_y2], [d_x, d_y, d_x2, d_y2]):
+                elif label in ['semi_grided_table', 'grided_table', 'gridless_table', 'key_value']:
+                    boo, area, perc = self.isRectangleOverlap([v_x, v_y, v_x2, v_y2], [d_x, d_y, d_x2, d_y2])
+                    if boo == True and perc > 0.4:
                         df0.loc[j, 'is_in_table'] = 1
-                        df0.loc[j, 'table_id'] = i
+                        df0.loc[j, 'table_id'] = cell_id
                         df0.loc[j, 'table_type'] = label
                         df0.loc[j, 't_x'] = d_x
                         df0.loc[j, 't_y'] = d_y
                         df0.loc[j, 't_w'] = d_x2 - d_x
                         df0.loc[j, 't_h'] = d_y2 - d_y
+
+                df0.loc[j, 'cell_overlap'] = str(overlap_index)
+
         return df0
 
-    def is_overlap_check_along_rows(self, ax1, ax2, aw, bx1, bx2, bw):
+    def is_overlap_check_along_rows(self, ax1, ax2, aw, bx1, bx2, bw, perc =0.07):
+        '''
+        This Function checks if there is an overlap between
+        x - coordinates of cells of boxes, irrespective of the y- coordinate
+        '''
         if aw < bw:
             if ((ax1 >= bx1) and (ax2 > bx1)) and ((ax1 < bx2) and (ax2 <= bx2)):
-                return True
+                return True, 1
         if bw < aw:
             if ((bx1 >= ax1) and (bx2 > ax1)) and ((bx1 < ax2) and (bx2 <= ax2)):
-                return True
+                return True, 1
         if ax1 <= bx1:
             if (bx1 >= ax1) and (bx2 > ax1) and (bx1 < ax2):  # ie bx1 lies between ax1 and ax2
                 per = (ax2 - bx1) / (ax2 - ax1)
-                if per > 0.07:
-                    return True
+                if per > perc:
+                    return True, per
         if bx1 <= ax1:
             if (ax1 >= bx1) and (ax2 > bx1) and (ax1 < bx2):  # ie bx1 lies between ax1 and ax2
                 per = (bx2 - ax1) / (bx2 - bx1)
-                if per > 0.07:
-                    return True
+                if per > perc:
+                    return True, per
 
     def isRectangleOverlap(self, R1, R2):
+        '''
+        This function detects if two rectangles overlap
+        '''
 
         if (R1[0] >= R2[2]) or (R1[2] <= R2[0]) or (R1[3] <= R2[1]) or (R1[1] >= R2[3]):
-            return False
+            return False, 0, 0
         else:
-            return True
+            # intersection along X - axis
+            dx = min(R1[2], R2[2]) - max(R1[0], R2[0])
+            dy = min(R1[3], R2[3]) - max(R1[1], R2[1])
+
+            area = dx * dy
+
+            wR1 = R1[2] - R1[0]
+            wR2 = R2[2] - R2[0]
+
+            if wR1 > wR2:
+                # Rectangle R2 is small
+                area_small_R = wR2 * (R2[3] - R2[1])
+            else:
+                area_small_R = wR1 * (R1[3] - R1[1])
+            per = round(area / area_small_R, 2)
+            # print(area, per)
+            return True, area, per
 
     def line_num_correction(self, src_df):
 
@@ -501,7 +714,7 @@ class PyMuPdf:
                 val = df_n.loc[ind, 'y']
                 zn.append(ctr)
             else:
-                if (df_n.loc[ind, 'y'] in range(val, val+10)) or (df_n.loc[ind, 'y'] in range(val-10, val)):
+                if (df_n.loc[ind, 'y'] in range(val, val+5)) or (df_n.loc[ind, 'y'] in range(val-5, val)):
                     zn.append(ctr)
                 else:
                     ctr = ctr + 1
@@ -692,178 +905,234 @@ class PyMuPdf:
                         src.loc[ind, 'line_n'] = min(src.loc[ind, 'line_n'], src.loc[jind, 'line_n'])
                         src.loc[jind, 'line_n'] = min(src.loc[ind, 'line_n'], src.loc[jind, 'line_n'])
 
+        src.sort_values(['c_x', 'c_y'])
+        src.reset_index(drop=True, inplace=True)
         return src
 
     def handle_multiline_with_rule(self, df):
         """
-        the working is based on rule based model
-        """
+                the working is based on rule based model
+                """
         src = df.copy()
-        try:
-            # re-arranging the order of columns in final data frame
-            col = src.columns.sort_values(ascending=True).to_list()
-            src = src[col]
-            # replacing all empty cells with nan
-            src.replace(r'^\s*$', np.nan, regex=True, inplace=True)
-            # dropping all rows where all values are NaN
-            src = src.dropna(how='all', axis=0)
-            # droping all clumns where all values are NaN
-            for c in col:
-                if src[c].isna().all():
-                    src = src.drop(c, axis=1)
-                    col.remove(c)
 
-            # identiflying majority datatype of a column in final dataframe
-            col_type = {}
-            for c in col:
-                ct_num = 0
-                ct_othr = 0
-                for ind in src.index:
-                    val = src.loc[ind, c]
-                    if not pd.isna(val):
-                        val = val.strip().replace(',', '')
-                        val = val.strip.replace('$', '')
-                        val = val.strip().replace('.', '')
-                        try:
-                            val = float(val)
-                            ct_num += 1
-                        except:
-                            ct_othr += 1
-                    else:
+        # 1.a : storing column names in col
+        col = src.columns.sort_values(ascending=True).to_list()
+        # 1.b : replacing all empty cells with nan
+        src.replace(r'^\s*$', np.nan, regex=True, inplace=True)
+        # 1.c : dropping all rows where all values are NaN
+        src = src.dropna(how='all', axis=0)
+        # 1.d : droping all columns where all values are NaN
+        for c in col:
+            if src[c].isna().all():
+                src = src.drop(c, axis=1)
+                col.remove(c)
+        # STEP 2 :
+        # -------------- Identifying datatype of Each Columns --------------
+
+        col_type = {}
+        for c in col:
+            ct_num = 0
+            ct_othr = 0
+            for ind in src.index:
+                val = src.loc[ind, c]
+                if not pd.isna(val):
+                    val = val.strip().replace(',', '')
+                    val = val.strip().replace('$', '')
+                    val = val.strip().replace('.', '')
+                    try:
+                        val = float(val)
+                        src.loc[ind, c] = val
+                        ct_num += 1
+                    except:
                         ct_othr += 1
-                if ct_num > ct_othr:
-                    col_type.update({c: 'numeric'})
                 else:
-                    col_type.update({c: 'other'})
+                    ct_othr += 1
+            if ct_num > ct_othr:
+                col_type.update({c: 'numeric'})
+            else:
+                col_type.update({c: 'other'})
+        # ---------------------------------------------------------------------
+        # STEP 3:  Identifying All Index where NaN is present
+        rows_with_nan = [index for index, row in src.iterrows() if row.isnull().any()]
+        rows_with_no_nan = [index for index, row in src.iterrows() if not row.isnull().any()]
+        rows_with_nan_ = rows_with_nan.copy()
+        rows_with_nan_n_num_n_str = []  # indexes where we have nan + number + strings
 
-            # identifyong all indexex where nan is present
-            rows_with_nan = [index for index, row in src.iterrows() if row.isnull().any()]
-            rows_with_nan_ = rows_with_nan.copy()
-            rows_with_nan_n_num_n_str = []  # indexes where we have nan + number +strings
-            # checking if any of the index identified is a numerical value or not:
-            for ind in rows_with_nan_:
+        # check index identified as nan has a numerical value
+        for ind in rows_with_nan_:
+            for c in col:
+                val = src.loc[ind, c]
+                if not pd.isna(val):  # if value is not nan
+                    if not isinstance(val, (int, float, complex)):
+                        try:
+                            val = val.strip().replace(',', '')
+                            val = float(val)
+                            rows_with_nan.remove(ind)
+                            rows_with_nan_n_num_n_str.append(ind)
+                            src.loc[ind, c] = val  # changing the type in source dtaframe to numeric if possible
+                        except:
+                            pass
+                    else:
+                        rows_with_nan_n_num_n_str.append(ind)
+
+        # STEP 4 :
+        rows_with_nan_n_num_only = rows_with_nan_n_num_n_str.copy()
+        rows_with_nan_n_num_only_not_in_numeric_col = []
+        # check of index which have numbers, how many have a string too
+        for e in rows_with_nan_n_num_n_str:
+            total_na_in_row = src.loc[e, :].isna().sum()
+            if total_na_in_row == len(col) - 1:
                 for c in col:
-                    val = src.loc[ind, c]
-                    if not pd.isna(val):  # if value is not nan
-                        if not isinstance(val, (int, float, complex)):
-                            try:
-                                val = val.strip().replace(',', '')
-                                val = float(val)
-                                rows_with_nan.remove(ind)
-                                rows_with_nan_n_num_n_str.append(ind)
-                                src.loc[ind, c] = val  # changing the type in source dtaframe to numeric if possible
-                            except:
-                                pass
+                    val = src.loc[e, c]
+                    if not pd.isna(val):
+                        if isinstance(val, (int, float, complex)):
+                            type_of_col = col_type[c]
+                            if type_of_col == 'other':
+                                rows_with_nan.append(e)
+                                rows_with_nan_n_num_only_not_in_numeric_col.append(e)
+                                rows_with_nan_n_num_only.remove(e)
+            else:
+                rows_with_nan.append(e)
+                rows_with_nan_n_num_only.remove(e)
+        rows_with_nan.sort()
+        rows_with_nan_n_num_n_str = list(
+            (set(rows_with_nan_n_num_n_str) - set(rows_with_nan_n_num_only_not_in_numeric_col)) - set(
+                rows_with_nan_n_num_only))
+        rows_with_nan_n_num_n_str = list(set(rows_with_nan_n_num_n_str))
+        del [rows_with_nan_]
 
-            rows_with_nan_n_num_only = rows_with_nan_n_num_n_str.copy()
-            rows_with_nan_n_num_only_not_in_numeric_col = []
-            # check of index which have numbers, how many have a string too
-            for e in rows_with_nan_n_num_n_str:
-                total_na_in_row = src.loc[e, :].isna().sum()
-                if total_na_in_row == len(col) - 1:
-                    for c in col:
-                        val = src.loc[e, c]
-                        if not pd.isna(val):
-                            if isinstance(val, (int, float, complex)):
-                                type_of_col = col_type[c]
-                                if type_of_col == 'other':
-                                    rows_with_nan.append(e)
-                                    rows_with_nan_n_num_only_not_in_numeric_col.append(e)
-                                    rows_with_nan_n_num_only.remove(e)
-                else:
-                    rows_with_nan.append(e)
-                    rows_with_nan_n_num_only.remove(e)
-            rows_with_nan.sort()
-            rows_with_nan_n_num_n_str = list(
-                (set(rows_with_nan_n_num_n_str) - set(rows_with_nan_n_num_only_not_in_numeric_col)) - set(
-                    rows_with_nan_n_num_only))
-            del [rows_with_nan_]
+        # --------------------------- ------------------------------------
+        # STEP 6 : rule based merging
+        # 1. all values in row is nan except 1, and row following that is also nan, merge up
+        # 2.  all values in row is nan except 1, and row above it is in rows_with_nan
+        rows_with_nan = list(set(rows_with_nan))
 
-            # rule based merging
-            # 1. all values in row is nan except 1, and row following that is also nan, merge up
-            # 2.  all values in row is nan except 1, and row above it is in rows_with_nan
+        rows_with_nan_processed = []  # to keep track of processed indexes
 
-            rows_with_nan_processed = []  # to keep track of processed indexes
-            for ele in rows_with_nan:
-                total_na_in_row = src.loc[ele, :].isna().sum()
-                if total_na_in_row != len(col):  # check if complete row is nan or not
-                    if int(ele) - 1 not in rows_with_nan_n_num_only:  # check if ind-1 is not in rows_with_nan_n_num
-                        if total_na_in_row == len(col) - 1:
-                            if int(ele) + 1 in rows_with_nan:
-                                for c in col:
-                                    val = src.loc[ele, c]
-                                    if not pd.isna(val):
-                                        column = col.copy()
-                                        column.remove(c)
-                                        index = ele
-                                        # reconfirming the situation
-                                        if total_na_in_row == len(col) - 1 and pd.isna(src.loc[index + 1, c]):
-                                            for tc in column:
-                                                src.loc[index, tc] = src.loc[index + 1, tc]
-                                                src.loc[index + 1, tc] = np.nan
-                                            rows_with_nan_processed.append(ele)
-                    if int(
-                            ele) - 1 not in rows_with_nan_n_num_only and ele not in rows_with_nan_n_num_n_str and ele not in rows_with_nan_processed:
-                        # all such cells will be merged up
-                        if ele != 0:  # if index or ele is 0 there is no chance of merging it above
+        # processing rows having a Nan Value
+        for ele in rows_with_nan:
+            total_na_in_row = src.loc[ele, :].isna().sum()
+            # check if complete row is nan or not
+            if total_na_in_row != len(col):
+                # check if above row is  not in rows_with_nan_n_num
+                if int(ele) - 1 not in rows_with_nan_n_num_only:
+                    # check if all column except 1 is nan or not
+                    if total_na_in_row == len(col) - 1:
+                        # check if next ind is in rows with nan
+                        if int(ele) + 1 in rows_with_nan:
+                            for c in col:
+                                val = src.loc[ele, c]
+                                if not pd.isna(val):
+                                    column = col.copy()
+                                    column.remove(c)
+                                    index = ele
+                                    # reconfirming the situation
+                                    cond1 = total_na_in_row == len(col) - 1
+                                    cond2 = src.loc[index + 1, c]
+                                    if cond1 and pd.isna(cond2):
+                                        for tc in column:
+                                            src.loc[index, tc] = src.loc[index + 1, tc]
+                                            src.loc[index + 1, tc] = np.nan
+                                        rows_with_nan_processed.append(ele)
+                                    else:
+                                        # condition where line below starts with a small case
+                                        pass
+                if int(
+                        ele) - 1 not in rows_with_nan_n_num_only and ele not in rows_with_nan_n_num_n_str and ele not in rows_with_nan_processed:
+                    # all such cells will be merged up
+                    isUpFlag = False
+                    if ele != 0:  # if index or ele is 0 there is no chance of merging it above
+                        for tc in col:
+                            text1 = src.loc[ele - 1, tc]
+                            text2 = src.loc[ele, tc]
+                            if pd.isna(text1):
+                                text1 = ''
+                            else:
+                                text1 = str(text1)
+                            if pd.isna(text2):
+                                text2 = ''
+                            else:
+                                text2 = str(text2)
+                                isUpFlag = text2[0].isupper()
+                            # we check here if line below starts witha capital letter or not
+                            # bcoz most likely if the text starts witha capital letter it must not be merged
+                            if not isUpFlag:
+                                src.loc[ele - 1, tc] = text1 + text2
+                                src.loc[ele, tc] = np.nan
+                                rows_with_nan_processed.append(ele)
+                            else:
+                                # say for a column with nan we merged but be actually should not have
+                                # hence we remove it again from list of nan processed
+                                try:
+                                    rows_with_nan_processed.remove(ele)
+                                except:
+                                    pass
+                if int(ele) - 1 not in rows_with_nan_n_num_only and ele not in rows_with_nan_processed:
+                    if ele in rows_with_nan_n_num_n_str:
+                        if int(ele) - 1 in rows_with_nan and int(ele) - 2 in rows_with_nan \
+                                and int(ele) - 1 in rows_with_nan_processed:
+                            # text will be merged two levels up
                             for tc in col:
-                                text1 = src.loc[ele - 1, tc]
+                                text1 = src.loc[ele - 2, tc]
                                 text2 = src.loc[ele, tc]
                                 if pd.isna(text1):
                                     text1 = ''
-                                else:
-                                    text1 = str(text1)
                                 if pd.isna(text2):
                                     text2 = ''
-                                else:
-                                    text2 = str(text2)
-                                src.loc[ele - 1, tc] = text1 + text2
+                                src.loc[ele - 2, tc] = str(text1) + str(text2)
                                 src.loc[ele, tc] = np.nan
                             rows_with_nan_processed.append(ele)
 
-                    if int(ele) - 1 not in rows_with_nan_n_num_only and ele not in rows_with_nan_processed:
-                        if ele in rows_with_nan_n_num_n_str:
-                            if int(ele) - 1 in rows_with_nan and int(ele) - 2 in rows_with_nan and int(
-                                    ele) - 1 in rows_with_nan_processed:
-                                # text will be merged two levels up
-                                for tc in col:
-                                    text1 = src.loc[ele - 2, tc]
-                                    text2 = src.loc[ele, tc]
-                                    if pd.isna(text1):
-                                        text1 = ''
-                                    if pd.isna(text2):
-                                        text2 = ''
-                                    src.loc[ele - 2, tc] = str(text1) + str(text2)
-                                    src.loc[ele, tc] = np.nan
-                                rows_with_nan_processed.append(ele)
-        except:
-            pass
-        src.dropna(axis=0, how='all', inplace=True)
-        src.reset_index(drop=True, inplace=True)
+        # processing rows not having any Nan Value
+        # case 1 : complete row is filled but the row above has nan values & current row starts with
+        # lower case
+        for ele in rows_with_no_nan:
+            # check if ind is  ot zero ie ele-1 exists and the row above must have-had NaN
+            if ele - 1 in src.index and ele - 1 in rows_with_nan:
+                merge_flag = False
+                col_copy = col.copy()
+                for c in col:
+                    val = src.loc[ele - 1, c]
+                    # check if value in above col is nan
+                    if pd.isna(val):
+                        col_copy.remove(c)
+
+                # now considering column/columns where above value is not nan
+                for c in col_copy:
+                    curr_val = src.loc[ele, c]
+                    prev_val = src.loc[ele - 1, c]
+                    # make sure that neither current value nor prev value is of type--> 'numeric'
+                    if not isinstance(curr_val, (int, float, complex)) and not isinstance(prev_val,
+                                                                                          (int, float, complex)):
+                        # check if text below starts with a lower case letter
+                        if curr_val[0].islower():
+                            # then we merge the above cell down
+                            merge_flag = True
+                if merge_flag is True:
+                    for c in col:
+                        curr_val = src.loc[ele, c]
+                        prev_val = src.loc[ele - 1, c]
+                        if pd.isna(prev_val):
+                            prev_val = ''
+
+                        new_curr_val = str(prev_val) + ' ' + str(curr_val)
+                        src.loc[ele, c] = new_curr_val
+                        # changing above cell val to NaN
+                        src.loc[ele - 1, c] = np.nan
+        src = src.dropna(how='all', axis=0)
         return src
 
-    def writing_formated_table_to_excel(self, src_frame, save_path, read_path, page_no, save_excel):
+    def formatting_table_to_excel_like(self, src_frame, page_no):
         """
         this function takes input as the Source frame and path where to save the excel file generated
         :param src_frame: Source Dataframe
-        :param save_path: Path to save Excel at
-        :param read_path: Path to read Excel from
         :return: dataframe which can be written
         """
-        #if save_excel:
-        #if os.path.exists(read_path):
-            # myworkbook = load_workbook(read_path)
-            #os.remove(read_path)
-
-        #myworkbook = Workbook()
-        #worksheet = myworkbook.create_sheet(str(page_no))
-        #worksheet.title = str(page_no)
-        #if 'Sheet' in myworkbook.sheetnames:
-        #    myworkbook.remove(myworkbook['Sheet'])
-        #if str(page_no) in myworkbook.sheetnames:
-        #    myworkbook.remove(myworkbook[str(page_no)])
 
         if len(src_frame) > 0:
+
+            src_frame = src_frame.sort_values(['c_x', 'c_y'])
+            src_frame.reset_index(drop=True, inplace=True)
 
             no_of_lines = max(src_frame['line_n']) + 1
             max_col = max(src_frame['block_n']) + 1
@@ -876,18 +1145,9 @@ class PyMuPdf:
                 for r in range(len(temp_frame)):
                     tmp = temp_frame.loc[r, 'block_n']
                     v[tmp] = v[tmp] + temp_frame.loc[r, 'text'] + ' '
-                # writing to various cells
 
-                #for c in list(v.keys()):
-                    #if save_excel:
-                    #d = worksheet.cell(row=line_number, column=c + 1, value=v[c])
                 df_ = df_.append(v, ignore_index=True)
-            #try:
-                #if save_excel:
-                #myworkbook.save(save_path)
-             #   print('not saving file')
-            #except:
-            #    print('Could not save the Excel file')
+            df_ = df_.reindex(columns=sorted(df_.columns))
             return df_
         else:
             print("ERROR : TABLE not detected for page no ", page_no)
@@ -906,7 +1166,7 @@ class PyMuPdf:
         if save_excel:
             if os.path.exists(read_path):
                 myworkbook = load_workbook(read_path)
-                #os.remove(read_path)
+                # os.remove(read_path)
             else:
                 myworkbook = Workbook()
             if 'Sheet' in myworkbook.sheetnames:
@@ -928,9 +1188,630 @@ class PyMuPdf:
         else:
             return False
 
+    def column_detection_intrim_pred(self, src_img, det_df, page_n):
+
+        # identify unique tables detected by Table Model
+
+        # uniq_table_id = list(det_df['table_id'].unique())                 # using Metadata as input det_df
+        uniq_table_id = list(det_df['category_id'].unique())                # using lookup_detection_df as det_df
+
+        df_col_header = pd.DataFrame(columns=['x', 'y', 'w', 'h', 'x2', 'y2', 'name', 'conf'])
+
+        # Crop table area to feed to col detection model
+        for e in uniq_table_id:
+            if e in [0, 1, 2, 3]:                                           # check if supercategory is Table
+                df_temp = det_df.loc[det_df['category_id'] == e]
+                # df_temp = df_temp[['t_x', 't_y', 't_w', 't_h']]
+                df_temp = df_temp[['x', 'y', 'w', 'h']]
+                df_temp.drop_duplicates(inplace=True)
+
+                for ind in df_temp.index:
+                    tx0 = df_temp.loc[ind, 'x']
+                    ty0 = df_temp.loc[ind, 'y']
+                    tx1 = df_temp.loc[ind, 'w'] + tx0
+                    ty1 = df_temp.loc[ind, 'h'] + ty0
+
+                    # crop image for table
+                    crop_img = src_img[ty0:ty1, tx0:tx1]
+                    # run column detection model
+                    column_pred = self.get_table_v2(crop_img, page_n=page_n, object_names_list=['column'])
+
+                    for colde in column_pred:
+                        dx1, dy1, dx2, dy2, cls_label, conf = colde
+                        # print(cls_label)
+                        if conf > 0.9:
+                            if cls_label in ['column']:
+                                # df_col_header = df_col_header.append({'x': dx1 + tx0, 'y': dy1 + ty0, 'w': ((dx2 + tx0) - (dx1 + tx0)), 'h': ((dy2 + ty0) - (dy1 + ty0)), 'x2': dx2 + tx0, 'y2': dy2 + ty0, 'name': cls_label, 'conf': conf}, ignore_index=True)
+                                df_col_header = df_col_header.append(
+                                    {'x': dx1 + tx0, 'y': ty0+10, 'w': ((dx2 + tx0) - (dx1 + tx0)),
+                                     'h': ty1-ty0-20 , 'x2': dx2 + tx0, 'y2': ty1-10,
+                                     'name': cls_label, 'conf': conf}, ignore_index=True)
+
+                            if cls_label in ['header']:
+                                # df_col_header = df_col_header.append({'x': dx1 + tx0, 'y': dy1 + ty0, 'w': ((dx2 + tx0) - (dx1 + tx0)), 'h': ((dy2 + ty0) - (dy1 + ty0)), 'x2': dx2 + tx0, 'y2': dy2 + ty0, 'name': cls_label, 'conf': conf}, ignore_index=True)
+                                df_col_header = df_col_header.append(
+                                    {'x': tx0, 'y': dy1 + ty0, 'w': tx1- tx0,
+                                     'h': ((dy2 + ty0) - (dy1 + ty0)), 'x2': tx1, 'y2': dy2 + ty0, 'name': cls_label,
+                                     'conf': conf}, ignore_index=True)
+
+        df_col_header.sort_values(['x'], inplace=True)
+        df_col_header = df_col_header.reset_index(drop=True)
+        return df_col_header
+
+    def column_det_overlap_remove(self, col_head_det):
+        '''
+        This function removes all columns that overlap along x-asis / horizontal axis
+        '''
+        # Make sure columns dont overlap
+        col_head_det_ = col_head_det.copy()
+
+        header_only = col_head_det_.loc[col_head_det_['name']=='header']
+        col_only = col_head_det_.loc[col_head_det_['name']=='column']
+        col_only2 = col_head_det_.loc[col_head_det_['name'] == 'column']
+
+        col_only.sort_values(by=['x2', 'name'], inplace=True)
+        col_only.drop(col_only[col_only['name'] == 'header'].index, inplace=True)
+        col_only.reset_index(drop=True, inplace=True)
+
+        col_only2.sort_values(by=['x2', 'name'], inplace=True)
+        col_only2.drop(col_only2[col_only2['name'] == 'header'].index, inplace=True)
+        col_only2.reset_index(drop=True, inplace=True)
+
+        for i in range(1, len(col_only)):
+            current_x1 = col_only.loc[i, 'x']
+            previous_x2 = col_only.loc[i - 1, 'x2']
+            if previous_x2 > current_x1:
+                pixels_overlap = previous_x2 - current_x1
+                # previous_new = previous_x2 - int(pixels_overlap / 2)
+                previous_new = min(previous_x2, current_x1)
+                col_only2.loc[i, 'x'] = previous_new + 10
+                col_only2.loc[i - 1, 'x2'] = previous_new
+                # width value changes
+                col_only2.loc[i, 'w'] = col_only2.loc[i, 'x2'] - col_only2.loc[i, 'x']
+                col_only2.loc[i-1, 'w'] = col_only2.loc[i-1, 'x2'] - col_only2.loc[i-1, 'x']
+
+        header_only = header_only.append(col_only2, ignore_index=True)
+        return header_only
+
+    def column_remove_annotations_in_multi_columns(self, cell_det_frame, col_det_frame):
+
+        cell_det_new = cell_det_frame.copy()
+        drop_indexes = []
+
+        for cell_det_ind in cell_det_frame.index:
+            label = cell_det_frame.loc[cell_det_ind, 'name']
+            if label in ['cell', 'special_cell']:
+                cex = cell_det_frame.loc[cell_det_ind, 'x']
+                cey = cell_det_frame.loc[cell_det_ind, 'y']
+                cex2 = cell_det_frame.loc[cell_det_ind, 'x2']
+                cey2 = cell_det_frame.loc[cell_det_ind, 'y2']
+                ceid = cell_det_frame.loc[cell_det_ind, 'id']
+
+                lst = []
+                for col_det_ind in col_det_frame.index:
+                    label = col_det_frame.loc[col_det_ind, 'name']
+                    if label in ['column']:
+                        cox = col_det_frame.loc[col_det_ind, 'x']
+                        coy = col_det_frame.loc[col_det_ind, 'y']
+                        cox2 = col_det_frame.loc[col_det_ind, 'x2']
+                        coy2 = col_det_frame.loc[col_det_ind, 'y2']
+
+                        boo, area, per = self.isRectangleOverlap(R1=[cox, coy, cox2, coy2], R2=[cex, cey, cex2, cey2])
+                        if boo is True: # and per > 0.4:
+                            lst.append([cox, coy, cox2, coy2])
+                if len(lst) > 1:
+                    drop_indexes.append(cell_det_ind)
+                    # we now remove orignal detection and create new detections
+                    for col in lst:
+                        if col[0] < cex < col[2]:
+                            # new coordinates will be
+                            xmin = cex
+                            xmax = col[2] - 5
+                            ymin = cey
+                            ymax = cey2
+                            w_new = xmax - xmin
+                            # it only makes sense to check if the width of new cell is > 15 pixel atleast
+                            if w_new > 15:
+                                cell_det_new = cell_det_new.append(
+                                    {'id':len(cell_det_new), 'x': xmin, 'y': ymin, 'w': w_new, 'h': ymax - ymin,
+                                     'x2': xmax, 'y2': ymax, 'label': 'cell', 'conf': 2,
+                                     'category_id': 4, 'name': 'cell',
+                                     'supercategory': 'sentence'},
+                                    ignore_index=True)
+                        if cex2 > col[0] and cex2 < col[2]:
+                            # new coordinates will be
+                            xmin = col[0] + 5
+                            xmax = cex2
+                            ymin = cey
+                            ymax = cey2
+                            w_new = xmax - xmin
+                            # it only makes sense to check if the width of new cell is > 15 pixel atleast
+                            if w_new > 15:
+                                cell_det_new = cell_det_new.append(
+                                    {'id':len(cell_det_new),'x': xmin, 'y': ymin, 'w': w_new, 'h': ymax - ymin,
+                                     'x2': xmax, 'y2': ymax, 'label': 'cell', 'conf': 2,
+                                     'category_id': 4, 'name': 'cell',
+                                     'supercategory': 'sentence'},
+                                    ignore_index=True)
+
+        cell_det_new.drop(cell_det_new.index[drop_indexes], inplace=True)
+        cell_det_new.reset_index(drop=True, inplace=True)
+        cell_det_new_2 = self.overlap_of_detections_check(cell_det_new)
+        cell_det_new_3 = self.overlap_det_removal_after_check(cell_det_new_2)
+
+        return cell_det_new_3
+
+    def cells_remove_overlap_annotations(self, col_det_df, lookup_det):
+
+        # using column detection we get anootations of column only
+        col_only = col_det_df.loc[col_det_df['name'] == 'column']
+        col_only.sort_values(by=['x'], inplace=True)
+        col_only.reset_index(drop=True, inplace=True)
+
+        # in Lookup detection frame we add a column called 'col' = -1
+        # and identify which column the detection will belong to
+        lookup_det['col'] = -1  # --------> Lookup Detections DF
+        for i in range(len(lookup_det)):
+            name = lookup_det.loc[i, 'supercategory']
+            if name in ['sentence']:
+                ce_x = lookup_det.loc[i, 'x'] + 5
+                ce_x2 = lookup_det.loc[i, 'x2']
+                for jind in col_only.index:
+                    co_x = col_only.loc[jind, 'x']
+                    co_x2 = col_only.loc[jind, 'x2']
+                    if (co_x2 > ce_x > co_x) or (co_x > ce_x2 > co_x2):
+                        lookup_det.loc[i, 'col'] = jind
+
+        lookup_copy = lookup_det.copy()
+        cell_det = lookup_det.loc[lookup_det['name'] == 'cell']
+        cell_det = cell_det.loc[lookup_det['col'] > -1]
+
+        unique_col = cell_det['col'].unique()
+        # considering all detections where column is greater that  -1
+        for ucol in unique_col:
+            if ucol >= 0:
+                tmp = cell_det.loc[cell_det['col'] == ucol]
+                tmp.sort_values(by=['y2'], inplace=True)
+                tmp.reset_index(drop=False, inplace=True)
+                for i in range(1, len(tmp)):
+                    current_y1 = tmp.loc[i, 'y']
+                    previous_y2 = tmp.loc[i - 1, 'y2']
+
+
+
+                    cur_ind = tmp.loc[i, 'index']
+                    pre_ind = tmp.loc[i - 1, 'index']
+
+                    if previous_y2 > current_y1:
+                        pixels_overlap = previous_y2 - current_y1
+                        pre_new_val = min(current_y1, previous_y2) - 5
+                        cur_new_val = max(current_y1, previous_y2) + 5
+
+                        lookup_copy.loc[pre_ind, 'y2'] = pre_new_val
+                        lookup_copy.loc[cur_ind, 'y'] = cur_new_val
+
+                        lookup_copy.loc[pre_ind, 'h'] = lookup_copy.loc[pre_ind, 'y2'] - lookup_copy.loc[pre_ind, 'y']
+                        lookup_copy.loc[cur_ind, 'h'] = lookup_copy.loc[cur_ind, 'y2'] - lookup_copy.loc[cur_ind, 'y']
+        lookup_copy.drop(['col'], axis=1, inplace=True)
+
+        return lookup_copy
+
+    def identify_headers(self, src_df, col_det_df):
+        '''
+        src_df      :   Dataframe with metadata and table -cell overlap
+        col_det_df  :   Dataframe of detections by column Model
+        '''
+        for src_ind in src_df.index:
+            src_rec = [src_df.loc[src_ind, 'x'], src_df.loc[src_ind, 'y'],
+                       src_df.loc[src_ind, 'x'] + src_df.loc[src_ind, 'w'],
+                       src_df.loc[src_ind, 'y'] + src_df.loc[src_ind, 'h']]
+            for coldet_ind in col_det_df.index:
+                label = col_det_df.loc[coldet_ind, 'name']
+                if label in ['header', 'headers']:
+                    coldet_rec = [col_det_df.loc[coldet_ind, 'x'], col_det_df.loc[coldet_ind, 'y'],
+                                  col_det_df.loc[coldet_ind, 'x2'], col_det_df.loc[coldet_ind, 'y2']]
+                    boo, area, per = self.isRectangleOverlap(coldet_rec, src_rec)
+                    if boo is True and per > 0.3:
+                        src_df.loc[src_ind, 'header'] = 1
+        return src_df
+
+    def column_creation_v1(self,  src_df, columdet):
+        header_flag = -1
+        frame = src_df.loc[src_df['header'] == 1]
+        # check to see if 'HEADER' is detected
+        if len(frame) > 0:                                      # HEADER is present in detection from Column model
+            header_flag = 1
+            frame.sort_values(['x'], inplace=True)
+            frame = frame.reset_index(drop=False)
+            for ind in frame.index:
+                hx1 = frame.loc[ind, 'x']
+                hx2 = frame.loc[ind, 'x'] + frame.loc[ind, 'w']
+                for indcol in columdet.index:
+                    name = columdet.loc[indcol, 'name']
+                    if name not in ['header']:
+                        colx1 = columdet.loc[indcol, 'x']
+                        colx2 = columdet.loc[indcol, 'x2']
+                        if hx1 >= colx1 and hx2 <= colx2 and frame.loc[ind, 'col'] == -1:
+                            frame.loc[ind, 'col'] = indcol
+                        else:
+                            if hx1 < colx1 and frame.loc[ind, 'col'] == -1:
+                                frame.loc[ind, 'col'] = -99
+        else:                                                   # if ONLY Column was detected and no Header was found
+            src_df.sort_values(['x', 'y'], inplace=True)
+            src_df = src_df.reset_index(drop=True)
+
+            columdet.sort_values(['x', 'y'], inplace=True)
+            zcol_det_df = columdet.reset_index(drop=True)
+
+            # this dict is used to populate the column index and percentage overlap between coordinates and column detection
+            ovelap_lst = {}
+
+            # using metadata here
+            for i in range(len(src_df)):
+                src_x = src_df.loc[i, 'x']
+                src_x2 = src_x + src_df.loc[i, 'w']
+                for jind in zcol_det_df.index:
+                    col_x = zcol_det_df.loc[jind, 'x']
+                    col_x2 = zcol_det_df.loc[jind, 'x2']
+
+                    # check complete overlap
+                    if src_x >= col_x and src_x2 <= col_x2 and src_df.loc[i, 'col'] == -1:
+                        src_df.loc[i, 'col'] = jind
+                        break
+                    # check partial Overlap
+                    else:
+                        overlap = self.is_overlap_check_along_rows(ax1=col_x, ax2=col_x2, aw=col_x2 - col_x, bx1=src_x, bx2=src_x2, bw=src_x2 - src_x, perc=0.4)
+                        if overlap:
+                            boo, per = overlap
+                            if boo is True:
+                                ovelap_lst.update({jind: per})
+
+                # if there was a partial overlap, we need to find index of column having Maximum
+                # overlap with, hence following will run only if there was partial overlap
+                if len(ovelap_lst) > 0:
+                    keys = list(ovelap_lst.keys())  # in python 3, you'll need `list(i.keys())`
+                    values = list(ovelap_lst.values())
+                    max_overlap_was_with_col = keys[values.index(max(values))]
+                    src_df.loc[i, 'col'] = max_overlap_was_with_col
+            frame = src_df.copy()
+
+        # this code creates the ctr for unidentified words in header
+        ctr = 10
+        for i in range(len(frame)):
+            val = frame.loc[i, 'col']
+            nextval = None
+            temp = []
+            if val < 0:
+                temp.append(i)
+                flag = -1
+                for j in range(i + 1, len(frame)):
+                    jval = frame.loc[j, 'col']
+                    if flag < 0 and jval < 0:
+                        temp.append(j)
+                    else:
+                        flag = 1
+                        nextval = frame.loc[j, 'col']
+                        break
+            for k in temp:
+                frame.loc[k, 'col'] = ctr
+            ctr = ctr + 1
+        #
+        dic = {}
+        unique_col = list(frame['col'].unique())
+        for e in unique_col:
+            temp_df = frame[frame['col'] == e]
+            dic.update({e: [min(temp_df['x']), max(temp_df['x'] + temp_df['w'])]})
+        new = pd.DataFrame.from_dict(dic)
+        new = new.transpose()
+        new = new.sort_values(by=[0])
+        new = new.reset_index(drop=False)
+
+        columdet = columdet.sort_values(by=['x'])
+        columdet = columdet.reset_index(drop=False)
+        for len_ind in new.index:
+            index_val = new.loc[len_ind, 'index']
+            len_xmin = new.loc[len_ind, 0]
+            len_xmax = new.loc[len_ind, 1]
+
+            # getting values from col detection model
+            if index_val in list(columdet['index']):
+                det_xmin = columdet.loc[index_val, 'x']
+                det_xmax = columdet.loc[index_val, 'x2']
+
+                xmin = min(len_xmin, det_xmin)
+                xmax = max(len_xmax, det_xmax)
+
+                #
+                new.loc[len_ind, 0] = xmin
+                new.loc[len_ind, 1] = xmax
+                columdet.loc[index_val, 'x'] = xmin
+                columdet.loc[index_val, 'x2'] = xmax
+                columdet.loc[index_val, 'w'] = xmax - xmin
+            else:
+                xmin = len_xmin
+                xmax = len_xmax
+                columdet = columdet.append(
+                    {'index': index_val, 'x': xmin, 'y': 0, 'w': xmax - xmin, 'h': 0, 'x2': xmax, 'y2': 0,
+                     'name': 'column', 'conf': 1}, ignore_index=True)
+        columdet = columdet.sort_values(by=['x'])
+        columdet = columdet.reset_index(drop=True)
+
+        lst = []
+
+        for ind in new.index:
+            old_val = new.loc[ind, 'index']
+            new_val = ind
+            for k in range(len(frame)):
+                if frame.loc[k, 'col'] == old_val:
+                    lst.append(new_val)
+        frame['col'] = lst
+
+        if header_flag < 0:
+            src_df = frame.copy()
+
+        if header_flag > 0:
+            # setting new col values identified into source Fame
+            for i in range(len(frame)):
+                colval = frame.loc[i, 'col']
+                index_val = frame.loc[i, 'index']
+                src_df.loc[index_val, 'col'] = colval
+        new = new.drop('index', axis=1)
+
+        return src_df, new, columdet
+
+    def column_creation_1(self,src_df, columdet):
+        """
+        src_df : Metadata information Dataframe
+        columdet : column detection
+        """
+        header_flag = -1
+        frame = src_df.loc[src_df['header'] == 1]
+        # check to see if 'HEADER' is detected
+        if len(frame) > 0:  # HEADER is present in detection from Column model
+            header_flag = 1
+            frame.sort_values(['x'], inplace=True)
+            frame = frame.reset_index(drop=False)
+            for ind in frame.index:
+                hx1 = frame.loc[ind, 'x']
+                hx2 = frame.loc[ind, 'x'] + frame.loc[ind, 'w']
+                for indcol in columdet.index:
+                    name = columdet.loc[indcol, 'name']
+                    if name not in ['header']:
+                        colx1 = columdet.loc[indcol, 'x']
+                        colx2 = columdet.loc[indcol, 'x2']
+                        if hx1 >= colx1 and hx2 <= colx2 and frame.loc[ind, 'col'] == -1:
+                            frame.loc[ind, 'col'] = indcol
+                        else:
+                            if hx1 < colx1 and frame.loc[ind, 'col'] == -1:
+                                frame.loc[ind, 'col'] = -99
+        else:  # if ONLY Column was detected and no Header was found
+            src_df.sort_values(['x', 'y'], inplace=True)
+            src_df = src_df.reset_index(drop=True)
+
+            columdet.sort_values(['x', 'y'], inplace=True)
+            zcol_det_df = columdet.reset_index(drop=True)
+            # using metadata here
+            for i in range(len(src_df)):
+                src_x = src_df.loc[i, 'x']
+                src_x2 = src_x + src_df.loc[i, 'w']
+                ovelap_lst = {}
+                for jind in zcol_det_df.index:
+                    col_x = zcol_det_df.loc[jind, 'x']
+                    col_x2 = zcol_det_df.loc[jind, 'x2']
+
+                    # check complete overlap
+                    if src_x >= col_x and src_x2 <= col_x2 and src_df.loc[i, 'col'] == -1:
+                        src_df.loc[i, 'col'] = jind
+                        break
+                    # check partial Overlap
+                    else:
+                        overlap = self.is_overlap_check_along_rows(ax1=col_x, ax2=col_x2, aw=col_x2 - col_x, bx1=src_x,
+                                                              bx2=src_x2, bw=src_x2 - src_x, perc=0.4)
+                        if overlap:
+                            boo, per = overlap
+                            if boo is True:
+                                ovelap_lst.update({jind: per})
+                if len(ovelap_lst) > 0:
+                    keys = list(ovelap_lst.keys())  # in python 3, you'll need `list(i.keys())`
+                    values = list(ovelap_lst.values())
+                    max_overlap_was_with_col = keys[values.index(max(values))]
+                    src_df.loc[i, 'col'] = max_overlap_was_with_col
+            frame = src_df.copy()
+        return frame, header_flag
+
+    def column_creation_2(self,frame):
+        # this code creates the ctr for unidentified words in header
+        ctr = 10
+        for i in range(len(frame)):
+            val = frame.loc[i, 'col']
+            nextval = None
+            temp = []
+            if val < 0:
+                temp.append(i)
+                flag = -1
+                for j in range(i + 1, len(frame)):
+                    jval = frame.loc[j, 'col']
+                    if flag < 0 and jval < 0:
+                        temp.append(j)
+                    else:
+                        flag = 1
+                        nextval = frame.loc[j, 'col']
+                        break
+            for k in temp:
+                frame.loc[k, 'col'] = ctr
+            ctr = ctr + 1
+        return frame
+
+    def col_creation_3(self,frame):
+        dic = {}
+        unique_col = list(frame['col'].unique())
+        for e in unique_col:
+            temp_df = frame[frame['col'] == e]
+            dic.update({e: [min(temp_df['x']), max(temp_df['x'] + temp_df['w'])]})
+        new = pd.DataFrame.from_dict(dic)
+        new = new.transpose()
+        new = new.sort_values(by=[0])
+        new = new.reset_index(drop=False)
+        return new
+
+    def col_creation_4(self,col_length, col_det_df):
+        '''
+        this function takes as input
+        1. col_length_frame     : this is creteated using min of metadata cordinates and max of metadata
+        2. colDetection_frame   : this is the output of Column model
+        here we use the two information to adjust the satrt and end values of columns
+        '''
+        col_length = col_length.sort_values(by=[0])
+        col_length = col_length.reset_index(drop=True)
+
+        col_det_df = col_det_df.sort_values(by=['x'])
+        col_det_df = col_det_df.reset_index(drop=False)
+
+        # list of all index in Model Detection Frame
+        check_list = list(col_det_df['index'])
+
+        for len_ind in col_length.index:
+            index_val = col_length.loc[len_ind, 'index']
+            len_xmin = col_length.loc[len_ind, 0]
+            len_xmax = col_length.loc[len_ind, 1]
+
+            # getting values from col detection model
+            if index_val in list(col_det_df['index']):
+                det_xmin = col_det_df.loc[index_val, 'x']
+                det_xmax = col_det_df.loc[index_val, 'x2']
+
+                xmin = min(len_xmin, det_xmin)
+                xmax = max(len_xmax, det_xmax)
+
+                #
+                col_length.loc[len_ind, 0] = xmin
+                col_length.loc[len_ind, 1] = xmax
+                col_det_df.loc[index_val, 'x'] = xmin
+                col_det_df.loc[index_val, 'x2'] = xmax
+                col_det_df.loc[index_val, 'w'] = xmax - xmin
+
+                check_list.remove(index_val)
+
+            else:
+                xmin = len_xmin
+                xmax = len_xmax
+                col_det_df = col_det_df.append(
+                    {'index': index_val, 'x': xmin, 'y': 0, 'w': xmax - xmin, 'h': 0, 'x2': xmax, 'y2': 0,
+                     'name': 'column', 'conf': 1}, ignore_index=True)
+
+        if len(check_list) > 0:
+            for inde in col_det_df.index:
+                index_val = col_det_df.loc[inde, 'index']
+                if index_val in check_list:
+                    name = col_det_df.loc[inde, 'name']
+                    if name == 'header':
+                        check_list.remove(index_val)
+                    else:
+                        xmin = col_det_df.loc[inde, 'x']
+                        xmax = col_det_df.loc[inde, 'x2']
+                        col_length = col_length.append({'index': index_val, 0: xmin, 1: xmax}, ignore_index=True)
+
+        col_det_df = col_det_df.sort_values(by=['x'])
+        col_det_df = col_det_df.reset_index(drop=True)
+
+        col_length = col_length.sort_values(by=[0])
+        col_length = col_length.reset_index(drop=True)
+
+        return col_length, col_det_df
+
+    def col_creation_5(self, frame, new):
+        lst = []
+
+        for ind in new.index:
+            old_val = new.loc[ind, 'index']
+            new_val = ind
+            for k in range(len(frame)):
+                if frame.loc[k, 'col'] == old_val:
+                    lst.append(new_val)
+        frame['col'] = lst
+        return frame
+
+    def column_creation(self,src_df, coldetection):
+
+        # STEP 1. Source Dataframe and detetion of Column Model is used
+        # to create a frame where Column 'col' is populated based on
+        # a. Header is ther
+        # b. No Header was detected
+        frame, header_flag = self.column_creation_1(src_df, coldetection)
+
+        # STEP 2. if any column was not identified that is filled
+        frame = self.column_creation_2(frame)
+
+        # STEP 3: A Dataframe is created that has width of each column
+        new = self.col_creation_3(frame)
+
+        # STEP 4 . Information of Column detection using Model and new_frame in step 3
+        # is used to populate proper width of each col
+        new, coldetection = self.col_creation_4(new, coldetection)
+
+        # STEP 5 column value is corrected in header frame
+        frame = self.col_creation_5(frame, new)
+
+        if header_flag < 0:
+            src_df = frame.copy()
+        if header_flag > 0:
+            for i in range(len(frame)):
+                colval = frame.loc[i, 'col']
+                index_val = frame.loc[i, 'index']
+                src_df.loc[index_val, 'col'] = colval
+        new = new.drop('index', axis=1)
+        return src_df, new, coldetection
+
+    def column_corr_final(self, src_df, col_range_frame):
+        '''
+        This function is used to updtate column values
+        using detections from Column Model
+        src_df              :   Dataframe
+        col_range_frame     :      prepared using column detection model
+        '''
+        for ind in src_df.index:
+            colvalue = src_df.loc[ind, 'col']
+            if colvalue < 0:
+                # using meta data
+                metacell_x1 = src_df.loc[ind, 'x']
+                metacell_w = src_df.loc[ind, 'w']
+                metacell_x2 = metacell_x1 + metacell_w
+
+                for detind in col_range_frame.index:
+                    x1 = col_range_frame.loc[detind, 0]
+                    x2 = col_range_frame.loc[detind, 1]
+                    w = x2 - x1
+
+                    booval = self.is_overlap_check_along_rows(metacell_x1, metacell_x2, metacell_w, x1, x2, w, perc=0.5)
+                    if booval:
+                        boo, per = booval
+                        if boo:
+                            src_df.loc[ind, 'col'] = detind
+                            break
+                    else:
+                        # Scenarios where metadata did not overlap
+                        # using cell value
+                        cell_x1 = src_df.loc[ind, 'c_x']
+                        cell_w = src_df.loc[ind, 'c_w']
+                        cell_x2 = cell_x1 + cell_w
+
+                        for detind in col_range_frame.index:
+                            x1 = col_range_frame.loc[detind, 0]
+                            x2 = col_range_frame.loc[detind, 1]
+                            w = x2 - x1
+
+                            booval = self.is_overlap_check_along_rows(cell_x1, cell_x2, cell_w, x1, x2, w, perc=0.5)
+                            if booval:
+                                boo, per = booval
+                                if boo:
+                                    src_df.loc[ind, 'col'] = detind
+                                    break
+        return src_df
+
     def model_init(self, model_name, det):
         if model_name in ['yolov5']:
             print('\n\t****** Initializing YOLOv5 Architecture for {} ****** '.format(det))
+            logger.info('\t****** Initializing YOLOv5 Architecture for {} ****** '.format(det))
             if det.lower() in ['cell', 'cells']:
 
                 # cell model initialization
@@ -939,9 +1820,12 @@ class PyMuPdf:
                 # WEIGHTS and YAML files
                 weights_path_cell_detection = str(ROOT) + '/table_cell_config/cell_030122_12_06pm_best.pt'
                 yaml_path_cell_detection = str(ROOT) + '/table_cell_config/cells.yaml'
-                print('\n****** Looking for Cell Model Files at following path ****** ')
+                print('\n****** Looking for Cell Model Files at following path ******')
                 print('WEIGHTS file path : ', weights_path_cell_detection)
                 print('YAML file path    : ', yaml_path_cell_detection)
+                logger.info('\n****** Looking for Cell Model Files at following path ******')
+                logger.info('WEIGHTS file path : {} '.format(weights_path_cell_detection))
+                logger.info('YAML file path    : {} '.format(yaml_path_cell_detection))
                 self.cell_model.model_init(weight_file_path=weights_path_cell_detection,
                                             yaml_file_path=yaml_path_cell_detection)
 
@@ -956,29 +1840,55 @@ class PyMuPdf:
                 print('\n****** Looking for Table Model Files at following path ****** ')
                 print('WEIGHTS file path : ', weights_path_table_detection)
                 print('YAML file path    : ', yaml_path_table_detection)
+                logger.info('\n****** Looking for Table Model Files at following path ******')
+                logger.info('WEIGHTS file path : {} '.format(weights_path_table_detection))
+                logger.info('YAML file path    : {} '.format(yaml_path_table_detection))
                 self.table_model.model_init(weight_file_path=weights_path_table_detection,
                                             yaml_file_path=yaml_path_table_detection)
 
         if model_name in ['mmlab', 'mmdet']:
-
+            logger.info('\t****** Initializing mmdetection RCNN Architecture for {} ****** '.format(det))
             if det.lower() in ['cell', 'cells']:
                 weights_path_cell_detection = str(ROOT) + '/table_cell_config/cell_cascadeRCNN_epoch_50.pth'
                 config_cell_detection = str(ROOT) + '/mmdet/configs/cascade_rcnn/cascade_rcnn_r101_fpn_1x_coco_custom_cell.py'
+
                 print('\n****** Looking for Cell Model Files at following path ****** ')
                 print('WEIGHTS file path    : ', weights_path_cell_detection)
                 print('CONFIG file path     : ', config_cell_detection)
 
+                logger.info('\t****** Looking for Cell Model Files at following path ******')
+                logger.info('WEIGHTS file path : {} '.format(weights_path_cell_detection))
+                logger.info('YAML file path    : {} '.format(config_cell_detection))
+
                 self.cell_model = init_detector(config_cell_detection, weights_path_cell_detection, device='cpu')
 
             elif det.lower() in ['table', 'tables']:
+                weights_path_table_detection = str(ROOT) + '/table_cell_config/table_cascadeRCNN_epoch_20.pth'
+                config_table_detection = str(ROOT) + '/mmdet/configs/cascade_rcnn/cascade_rcnn_r101_fpn_1x_coco_custom.py'
 
-                    weights_path_table_detection = str(ROOT) + '/table_cell_config/table_cascadeRCNN_epoch_20.pth'
-                    config_table_detection = str(ROOT) + '/mmdet/configs/cascade_rcnn/cascade_rcnn_r101_fpn_1x_coco_custom.py'
-                    print('\n****** Looking for Table Model Files at following path ****** ')
-                    print('WEIGHTS file path    : ', weights_path_table_detection)
-                    print('CONFIG file path     : ', config_table_detection)
+                print('\n****** Looking for Table Model Files at following path ****** ')
+                print('WEIGHTS file path    : ', weights_path_table_detection)
+                print('CONFIG file path     : ', config_table_detection)
 
-                    self.table_model = init_detector(config_table_detection, weights_path_table_detection, device='cpu')
+                logger.info('\t****** Looking for Table Model Files at following path ******')
+                logger.info('WEIGHTS file path : {} '.format(weights_path_table_detection))
+                logger.info('YAML file path    : {} '.format(config_table_detection))
+
+                self.table_model = init_detector(config_table_detection, weights_path_table_detection, device='cpu')
+
+            elif det.lower() in ['column', 'header']:
+                weights_path_column_detection = str(ROOT) + '/table_cell_config/epoch_50_column_new.pth'
+                config_column_detection = str(ROOT) + '/mmdet/configs/cascade_rcnn/cascade_rcnn_r101_fpn_1x_coco_custom_column.py'
+
+                print('\n******  Looking for Column / Header Model Files at following path ****** ')
+                print('WEIGHTS file path    : ', weights_path_column_detection)
+                print('CONFIG file path     : ', config_column_detection)
+
+                logger.info('\t****** Looking for Column / Header Model Files at following path ******')
+                logger.info('WEIGHTS file path : {} '.format(weights_path_column_detection))
+                logger.info('YAML file path    : {} '.format(config_column_detection))
+
+                self.column_model = init_detector(config_column_detection, weights_path_column_detection, device='cpu')
 
     def restructure_yolov5_predictions(self, table_pred, cell_pred):
         '''
@@ -1056,10 +1966,13 @@ class PyMuPdf:
             if cls_label in ['gridless_table', 'grided_table', 'semi_grided_table', 'key_value'] and conf > self.table_det_threshold:
                 temp = [x1, y1, x2, y2, cls_label, conf]
                 new_pred.append(temp)
+            else:
+                temp = [x1, y1, x2, y2, cls_label, conf]
+                new_pred.append(temp)
 
         return new_pred
 
-    def get_table_v2(self, image_np, page_n, object_names_list=['table', 'cell']):
+    def get_table_v2(self, image_np, page_n, object_names_list=['table', 'cell', 'column']):
         '''
         FOR MMDET detections (MaskRCNN / RCNN)
         This function takes input:
@@ -1070,26 +1983,327 @@ class PyMuPdf:
         table_pred          : A List of predictions in table_list_format
         '''
 
-        if ('table' in object_names_list) and self.table_model:
-            table_pred = inference_detector(self.table_model, image_np)
-            table_pred = self.restructure_mmdet_predictions(table_pred, model=self.table_model)
+        if ('table' in object_names_list) or ('cell' in object_names_list):
+            if ('table' in object_names_list) and self.table_model:
+                table_pred = inference_detector(self.table_model, image_np)
+                table_pred = self.restructure_mmdet_predictions(table_pred, model=self.table_model)
 
-        if ('cell' in object_names_list) and self.cell_model:
-            cell_pred = inference_detector(self.cell_model, image_np)
-            cell_pred = self.restructure_mmdet_predictions(cell_pred, model=self.cell_model)
+            if ('cell' in object_names_list) and self.cell_model:
+                cell_pred = inference_detector(self.cell_model, image_np)
+                cell_pred = self.restructure_mmdet_predictions(cell_pred, model=self.cell_model)
 
-        print('\n\n\t\t For page_n : ', page_n)
-        # print(len(table_pred), len(cell_pred))
-        table_pred.extend(cell_pred)
-        # print(len(table_pred), len(cell_pred))
-        return table_pred
+            table_pred.extend(cell_pred)
+            return table_pred
+
+        if 'column' in object_names_list:
+            column_pred = inference_detector(self.column_model, image_np)
+            column_pred = self.restructure_mmdet_predictions(column_pred, model=self.column_model)
+            return column_pred
+
+    def metadata_correcction_y_coordnates(self, df):
+        '''
+
+        '''
+        z = df.copy()
+        z.sort_values(by=['y'], inplace=True)
+        z.reset_index(drop=False, inplace=True)
+
+        for i in range(1, len(z)):
+            curr_y = z.loc[i, 'y']
+            pre_y = z.loc[i - 1, 'y']
+            if curr_y == pre_y:
+                pass
+            else:
+                diff = curr_y - pre_y
+                if diff > 15:
+                    pass
+                else:
+                    z.loc[i - 1, 'y'] = max(curr_y, pre_y)
+                    z.loc[i, 'y'] = max(curr_y, pre_y)
+                    z.loc[i - 1, 'y'] = max(curr_y, pre_y)
+
+        z.sort_values(by=['index'], inplace=True)
+        z.set_index('index', drop=True, inplace=True)
+        return z
+
+    def medatdata_y2_values_correction(self, df):
+
+        df_y = df[['y', 'h']]
+        df_y.drop_duplicates(inplace=True)
+        df_y.sort_values(by=['y'], inplace=True)
+        df_y.reset_index(drop=True, inplace=True)
+        df_y['y2'] = df_y['y'] + df_y['h']
+
+        df_y_copy = df_y.copy()
+        df_y_copy['new_y'] = -1
+        df_y_copy['new_y2'] = -1
+
+        for i in range(1, len(df_y)):
+            flag = -1
+            crr_y = df_y.loc[i, 'y']
+            pre_y2 = df_y.loc[i - 1, 'y2']
+
+            if pre_y2 > crr_y:
+                new_pre_y2 = min(pre_y2, crr_y) - 3
+                new_crr_y = max(pre_y2, crr_y) + 4
+
+                df_y_copy.loc[i, 'new_y'] = new_crr_y
+                df_y_copy.loc[i - 1, 'new_y2'] = new_pre_y2
+
+                flag = 1
+
+            # adjusting h value too
+            if flag > 0:
+                # 1. doing for i
+                if df_y_copy.loc[i, 'new_y'] > 0:
+                    if df_y_copy.loc[i, 'new_y2'] > 0:
+                        df_y_copy.loc[i, 'h'] = df_y_copy.loc[i, 'new_y2'] - df_y_copy.loc[i, 'new_y']
+                    else:
+                        df_y_copy.loc[i, 'h'] = df_y_copy.loc[i, 'y2'] - df_y_copy.loc[i, 'new_y']
+                else:
+                    if df_y_copy.loc[i, 'new_y2'] > 0:
+                        df_y_copy.loc[i, 'h'] = df_y_copy.loc[i, 'new_y2'] - df_y_copy.loc[i, 'y']
+
+                # 2. doing for i-1
+                if df_y_copy.loc[i - 1, 'new_y'] > 0:
+                    if df_y_copy.loc[i - 1, 'new_y2'] > 0:
+                        df_y_copy.loc[i - 1, 'h'] = df_y_copy.loc[i - 1, 'new_y2'] - df_y_copy.loc[i - 1, 'new_y']
+                    else:
+                        df_y_copy.loc[i - 1, 'h'] = df_y_copy.loc[i - 1, 'y2'] - df_y_copy.loc[i - 1, 'new_y']
+                else:
+                    if df_y_copy.loc[i - 1, 'new_y2'] > 0:
+                        df_y_copy.loc[i - 1, 'h'] = df_y_copy.loc[i - 1, 'new_y2'] - df_y_copy.loc[i - 1, 'y']
+
+        #  copy of input data frame to mak required changes
+        df_copy = df.copy()
+        for i in range(len(df_copy)):
+            y_val = df_copy.loc[i, 'y']
+            for j in range(len(df_y_copy)):
+                if y_val == df_y_copy.loc[j, 'y']:
+                    df_copy.loc[i, 'h'] = df_y_copy.loc[j, 'h']
+                    if df_y_copy.loc[j, 'new_y'] > 0:
+                        df_copy.loc[i, 'y'] = df_y_copy.loc[j, 'new_y']
+                    break
+        return df_copy
+
+    def lookupdetections_y1_y2_same_value_remove(self, lookupdet):
+        z1 = lookupdet.copy()
+        z1 = z1.drop_duplicates()
+        z1.sort_values(by=['x', 'y'], inplace=True)
+        z1.reset_index(drop=True, inplace=True)
+        z3 = z1.copy()
+        for i in range(1, len(z1)):
+            curr_y = z1.loc[i, 'y']
+            pre_y2 = z1.loc[i - 1, 'y2']
+            if curr_y == pre_y2:
+                print('----', i)
+                z3.loc[i, 'y'] = curr_y + 2
+                z3.loc[i - 1, 'y2'] = pre_y2 - 2
+
+                z3.loc[i, 'h'] = z1.loc[i, 'y2'] - curr_y + 2
+                z3.loc[i - 1, 'h'] = (pre_y2 - 2) - z1.loc[i - 1, 'y']
+
+        z3 = z3.drop_duplicates()
+        z3.reset_index(drop=True, inplace=True)
+        return z3
+
+    def overlap_of_detections_check(self, det):
+        '''
+        this function returns a detection datafame
+        with information of an overlap betwee them
+        @parms
+            det         : Detecttion Dataframe i.e lookup_detecton_df
+        @return
+            det_c       : Copy of det df with additional column 'overlap'
+                          'overlap' is a str(list of list wih info as :
+                          [cell_id, area, per]
+        '''
+        det_c = det.copy()
+        det_c['overlap'] = -1
+        for ind in det.index:
+            x11 = det.loc[ind, 'x']
+            x12 = det.loc[ind, 'x2']
+            y11 = det.loc[ind, 'y']
+            y12 = det.loc[ind, 'y2']
+            id1 = det.loc[ind, 'id']
+            cate1 = det.loc[ind, 'supercategory']
+            olap = []
+            for s_ind in det.index:
+                cate2 = det.loc[s_ind, 'supercategory']
+                if ind != s_ind and cate1 not in ['table'] and cate2 not in ['table']:
+
+                    x21 = det.loc[s_ind, 'x']
+                    x22 = det.loc[s_ind, 'x2']
+                    y21 = det.loc[s_ind, 'y']
+                    y22 = det.loc[s_ind, 'y2']
+                    id2 = det.loc[s_ind, 'id']
+                    boo, area, per = self.isRectangleOverlap([x11, y11, x12, y12], [x21, y21, x22, y22])
+                    if boo == True:
+                        # if thre is an overlap between two
+                        olap.append((s_ind, id2, area, per))
+            if len(olap) > 0:
+                det_c.loc[ind, 'overlap'] = [olap]
+        return det_c
+
+    def overlap_det_removal_after_check(self, det, id_ctr=None):
+
+        """
+        This function runs post --> overlap_of_detections_check
+        if overlap_of_detections_check identifies overlap between 2 cells
+        this fumction merges hem with effecive heigh reduce and width of max taken
+        """
+
+        remove_index = []
+        det_copy = det.copy()
+
+        if not id_ctr:
+            id_ctr = len(det_copy)
+
+        tmp_frame = det.loc[det['overlap'] != -1]
+        for ind in tmp_frame.index:
+            id_ind = tmp_frame.loc[ind, 'id']
+            overlap_lst = tmp_frame.loc[ind, 'overlap']
+            if id_ind not in remove_index:
+                for val in overlap_lst:
+                    _, olap_id, _, per = val
+                    olap_frma = tmp_frame.loc[tmp_frame['id'] == olap_id]
+                    olap_frma.reset_index(drop=False, inplace=True)
+                    # remove annotations only if percentage overlap is greater than threshold value
+                    if per > 0.8:
+                        cr_x = tmp_frame.loc[ind, 'x']
+                        cr_y = tmp_frame.loc[ind, 'y']
+                        cr_x2 = tmp_frame.loc[ind, 'x2']
+                        cr_y2 = tmp_frame.loc[ind, 'y2']
+
+                        olap_x = olap_frma.loc[0, 'x']
+                        olap_y = olap_frma.loc[0, 'y']
+                        olap_x2 = olap_frma.loc[0, 'x2']
+                        olap_y2 = olap_frma.loc[0, 'y2']
+
+                        new_y = max(cr_y, olap_y)
+                        new_y2 = min(cr_y2, olap_y2)
+                        new_x = min(cr_x, olap_x)
+                        new_x2 = max(cr_x2, olap_x2)
+                        new_w = new_x2 - new_x
+                        new_h = new_y2 - new_y
+
+                        det_copy = det_copy.append(
+                            {'id': id_ctr, 'x': new_x, 'y': new_y, 'w': new_w, 'h': new_h,
+                             'x2': new_x2, 'y2': new_y2, 'label': 'cell', 'conf': 2,
+                             'category_id': 4, 'name': 'cell',
+                             'supercategory': 'sentence', 'overlap': -1},
+                            ignore_index=True)
+                        id_ctr=id_ctr+1
+                        remove_index.append(olap_id)
+                        remove_index.append(id_ind)
+                    else:
+                        det_copy.loc[id_ind, 'overlap'] = -1
+        for e in remove_index:
+            det_copy.drop(det_copy.loc[det_copy['id'] == e].index, inplace=True)
+
+        det_copy.drop(['overlap', 'conf'], axis=1, inplace=True)
+        det_copy.set_index(['id'], inplace=True)
+        det_copy.drop_duplicates(inplace=True)
+        det_copy['id'] = det_copy.index
+        det_copy['conf'] = 2
+        det_copy['overlap'] = -1
+        det_copy.reset_index(drop=True, inplace=True)
+        return det_copy
+
+    def identify_overlap_of_det_along_y_axis(self, det, input_df):
+        """
+        this functon takes lookup_deection as input
+        and tries to identify possible multiline that was missed by model
+        given atleast 1 multiline  was detected by model
+
+        Combining 2 seperate functions as 1
+        """
+
+        # STEP : 1
+        '''we identify the y-axis ovelap for eah detection and information is stored in a new colmn'''
+        detcopy = det.copy()
+        detcopy['y_overlap'] = -1
+        detcopy['y_overlap'] = detcopy['y_overlap'].astype(object)
+
+        for i in range(len(detcopy)):
+            lst = []
+            cur_name = detcopy.loc[i, 'supercategory']
+            if cur_name not in ['table']:
+                cur_id = detcopy.loc[i, 'id']
+                cur_y = detcopy.loc[i, 'y']
+                cur_y2 = detcopy.loc[i, 'y2']
+
+                for j in range(len(detcopy)):
+                    sub_name = detcopy.loc[j, 'supercategory']
+                    if sub_name not in ['table'] and i != j:
+                        sub_id = detcopy.loc[j, 'id']
+                        sub_y = detcopy.loc[j, 'y']
+                        sub_y2 = detcopy.loc[j, 'y2']
+
+                        if (cur_y <= sub_y < cur_y2) or (cur_y <= sub_y2 < cur_y2):
+                            # nmber of pixel_overlap calculation
+                            if cur_y <= sub_y < cur_y2:
+                                num_pixel_overlap = abs(sub_y - cur_y2)
+                            if cur_y <= sub_y2 < cur_y2:
+                                num_pixel_overlap = abs(sub_y2 - cur_y)
+
+                            if num_pixel_overlap > 10:
+                                lst.append([j, sub_id, sub_y, sub_y2, num_pixel_overlap])
+
+                if len(lst) > 0:
+                    detcopy.loc[i, 'y_overlap'] = [lst]
+                else:
+                    pass
+
+        # STEP 2 :
+        '''the information captured in above section is use to modify the values of y, y2 and h columns'''
+
+        detcopy2 = detcopy.copy()
+
+        for i in range(len(detcopy2)):
+            if detcopy2.loc[i, 'y_overlap'] != -1:
+                new_y_lst = []
+                new_y2_lst = []
+                cr_y = detcopy2.loc[i, 'y']
+                cr_y2 = detcopy2.loc[i, 'y2']
+
+                new_y_lst.append(cr_y)
+                new_y2_lst.append(cr_y2)
+
+                y_olap_val = detcopy2.loc[i, 'y_overlap']
+
+                for val in y_olap_val:
+                    ind, id_, ol_y, ol_y2, pix_olap = val
+
+                    new_y_lst.append(ol_y)
+                    new_y2_lst.append(ol_y2)
+
+                new_y = min(new_y_lst)
+                new_y2 = max(new_y2_lst)
+                new_h = new_y2 - new_y
+
+                # now changng the vales of y coordinates in detectionn
+                detcopy2.loc[i, 'y'] = new_y
+                detcopy2.loc[i, 'y2'] = new_y2
+                detcopy2.loc[i, 'h'] = new_h
+
+        detcopy2.drop(['y_overlap'], axis=1, inplace=True)
+        detcopy3 = self.overlap_of_detections_check(detcopy2)
+        detcopy4 = self.overlap_det_removal_after_check(detcopy3, id_ctr=max(detcopy3['id']) + 1)
+
+        # rerunning cell overlap section again to incorporate new detections
+        datadf = self.df_to_table_df_v2(input_df=input_df, det_df=detcopy4)
+
+        return datadf, detcopy4
 
     def pdf_to_page_df_mypypdf_intrim(self, page_num, result_save):
-        """
+        '''
         This function extrats information for each page
-        :param page_num: Page number of PDF
-        :return:
-        """
+        :param
+                page_num        :   Page number of PDF
+                result_save     :   Boolean value, used to evaluate if subsequent images generated must be saved or not
+
+        '''
 
         dataframe_write = None                                              # Dataframe equivalent for excel
         pixel_dic = dict()                                                  # Local to Page Resolution Info
@@ -1111,8 +2325,16 @@ class PyMuPdf:
         im_resized = img.resize(size, Image.ANTIALIAS)
         open_cv_image = np.array(im_resized)
         open_cv_image = open_cv_image[:, :, ::-1].copy()                    # Convert RGB to BGR
+
+        # converting image to binary
+        open_cv_image = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2GRAY)
+        img = np.where(open_cv_image > 200, 255, 0)
+        # stacking 1 channel img to 3 channel image &
+        open_cv_image = cv2.merge((img, img, img))
+        open_cv_image = open_cv_image.astype(np.uint8)
+        del img
         image_name = self.result_dir + str(page_num) + '.jpeg'              # file path
-        cv2.imwrite(image_name, open_cv_image)                              # Saving file
+        cv2.imwrite(image_name, open_cv_image)
 
         # 1 page Information update
         pixel_dic.update({'x_res': x_res, 'y_res': y_res, 'width': page_width, 'height': page_height})
@@ -1149,100 +2371,129 @@ class PyMuPdf:
             dataframe["c_y"] = -1
             dataframe["c_w"] = -1
             dataframe["c_h"] = -1
+            # column
+            dataframe['header'] = -1
+            dataframe['col'] = -1
+            # overlap column
+            dataframe['cell_overlap'] = -1
 
-            df_raw = dataframe.copy()
-            dataframe.to_json(self.result_dir + str(page_num)+'_df0_before_processing.json')
+            # correcting Meta information in raw frame.
+            dataframe = self.metadata_correcction_y_coordnates(dataframe)
+            # correcting meta information of overlapping y2 -y coordinates
+            dataframe = self.medatdata_y2_values_correction(dataframe)
+            self.df_raw = dataframe.copy()
 
             # ---------------------------------- DEEP LEARNING MODEL FOR DETECTION ---------------------------------
             # DL Model Run   ----- NOTE : table_list has following format : [x0, y0, x1, y1, label, conf]
-
             table_list = self.get_table_v2(open_cv_image, page_num, object_names_list=['table', 'cell'])   # mmlab model
-            # table_list = self.get_detection_maskrcnn(open_cv_image, page_num)                         # MaskRCNN model
-            # table_list = self.get_detection_yolov5(open_cv_image, page_num)                            # YOLO v5 model
-
-            self.draw_detetion_save_img(table_list, image_name, page_num, name_of_file='_result_of_bbox_detected.jpeg')
-
-            # ------------------------------------------------------------------------------------------------------
-
             # creating a dataframe of all detections made by the model
             self.lookup_detections_df = self.get_lookup_detection_frame(table_list, self.lookup_category_id_annotation_df)
-            self.lookup_detections_df.to_json(self.result_dir + str(page_num) + '_det_frame_1_table_list.json')
+            # self.draw_detetion_save_img(tbl_lst=self.lookup_detections_df, img_p=image_name, page_num=page_num, name_of_file='_bbox_detected.jpeg', color=(255, 0, 255), result_save=True)
 
             # get undetected parts of image and save it
-            undet_img = self.get_undetected_parts_img(image_name, table_list, page_num, save_img=True)
+            # undet_img = self.get_undetected_parts_img(image_name, table_list, page_num, save_img=True)
 
+            # **************************   Column Detection Model  *****************
+            self.column_detection = self.column_detection_intrim_pred(open_cv_image, self.lookup_detections_df, page_n=page_num)
+            # --- Overlap of columns Remove. # Remember - Column santity is More important than Cell detection Model
+            self.column_detection = self.column_det_overlap_remove(self.column_detection)
+            self.draw_detetion_save_img(self.column_detection, image_name, page_num, name_of_file='_col_header.jpeg', result_save=result_save, color=(255, 0, 0))
+
+            # ---------------------  Removing all cell annotations that move in multiple columns  -------------------
+            self.lookup_detections_df = self.column_remove_annotations_in_multi_columns(cell_det_frame=self.lookup_detections_df, col_det_frame=self.column_detection)
+
+            # ------------------------------------------------------------------------------------------------------
             # fill dataframe with overlap information of table and cells from Model
             dataframe = self.df_to_table_df_v2(input_df=dataframe, det_df=self.lookup_detections_df)
-            dataframe.to_json(self.result_dir + str(page_num) + '_df1_overlap_table_cell.json')
 
             img_buffer = io.BytesIO()
             im_resized.save(img_buffer, dpi=(600, 600), format="jpeg")
 
+            # *********************  UNDETECTED Annotations ***************
             # get undetected annotations of undetected_img and add update the detection dataframe in __init__
-            dataframe, self.lookup_detections_df = self.get_undetected_parts_bbox(input_df=dataframe, det_df=self.lookup_detections_df, ref_frame=self.lookup_category_id_annotation_df)
+            # Dataframe returned below is sanity
+            dataframe, self.lookup_detections_df, df_undet_cell_ref = self.get_undetected_parts_bbox(input_df=dataframe, det_df=self.lookup_detections_df)
 
-            self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num, name_of_file='_result_of_improved_bbox.jpeg')
+            # dataframe, self.lookup_detections_df = self.height_correction_after_undetected_annotation(df=dataframe, ids_to_work_on=df_undet_cell_ref)
+            # self.lookup_detections_df = self.cells_remove_overlap_annotations(col_det_df=self.column_detection, lookup_det=self.lookup_detections_df)
+            # self.lookup_detections_df = self.lookupdetections_y1_y2_same_value_remove(lookupdet=self.lookup_detections_df)
+            # fill dataframe with overlap information of table and cells AGAIN
+            # dataframe = self.df_to_table_df_v2(input_df=dataframe, det_df=self.lookup_detections_df)
 
-            dataframe.to_json(self.result_dir + str(page_num) + '_df2_get_undetected_dataframe_0.json')
-            self.lookup_detections_df.to_json(self.result_dir + str(page_num) + '_det_frame_2_table_list_undetadded.json')
+            self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num,name_of_file='_improved_bbox.jpeg', result_save=result_save, color=(255, 0, 0))
 
-            # -----------------  doing post corrections --------------------------
+            # ------------------ trying to ge possible multiline basd on detetctions formed -------------
+            # Now we again modify the detections based on possible multiline
+            # given that moel identifies atleast one such mltiline
+            dataframe, self.lookup_detections_df = self.identify_overlap_of_det_along_y_axis(det=self.lookup_detections_df, input_df=dataframe)
+            self.draw_detetion_save_img(self.lookup_detections_df, image_name, page_num, name_of_file='_improved_bbox_multiline.jpeg', result_save=result_save, color=(255, 0, 0))
+
+            # --------------------  doing post corrections --------------------------
             # STEP 1 : Identifying values that belong to table and have been successfully detected
             dataframe = dataframe.loc[(dataframe['is_in_cell'] == 1)]
             dataframe = dataframe.loc[(dataframe['is_in_table'] == 1)]
-            dataframe.to_json(self.result_dir + str(page_num) + '_df_3_table_cell_area.json')
-            # STEP 2 : Lines sequence of words are corrected
-            dataframe = self.line_num_correction(src_df=dataframe)
-            dataframe.to_json(self.result_dir + str(page_num) + '_df_4_line_corr.json')
-            # STEP 3 : Word sequence horizontally are corrected
-            dataframe = self.word_num_corr(src_df=dataframe)
-            dataframe.to_json(self.result_dir + str(page_num) + '_df_5_word_corr.json')
-            # STEP 4 : Column identification and correction of Block values / Column values
-            dataframe = self.block_corr_final(src_df=dataframe)
-            dataframe.to_json(self.result_dir + str(page_num) + '_df_6_block_corr.json')
-            # STEP 4.a : Handling Multilines detected by model
-            orig_dataframe, dataframe = self.identify_cell_ids_with_multiline(src=dataframe)
-            # STEP 4.b : Handling Multiline part2
-            dataframe = self.multiline_correction_final(dataframe)
-            # STEP 5 : Write result to EXCEL File
-            dataframe = dataframe.sort_values(['cell_id', 'c_x', 'c_y'])
-            dataframe.reset_index(drop=True, inplace=True)
-            dataframe.to_json(self.result_dir + str(page_num) + '_df_7_multilinehandle.json')
-            # dataframe_write is dataframe which is near perfect excel format
-            dataframe_write = self.writing_formated_table_to_excel(src_frame=dataframe, save_path=self.result_dir +'pdf_data_excel.xlsx', read_path=self.result_dir +'pdf_data_excel.xlsx', page_no=page_num, save_excel=result_save)
-            dataframe_write.to_json(self.result_dir + str(page_num) + '_df_8_excel_write1.json')
-            # Handling Multiline with rules
-            dataframe_write = self.handle_multiline_with_rule(df=dataframe_write)
-            dataframe_write.to_json(self.result_dir + str(page_num) + '_df_8_excel_write2_multiline_rules_applied.json')
 
-            # Writing this updated frame to excel again
-            self.write_excel_after_multiline_handling(src_frame=dataframe_write, save_path=self.result_dir +'pdf_data_excel.xlsx', read_path=self.result_dir +'pdf_data_excel.xlsx', page_no=page_num, save_excel =result_save)
+            # run if table was detected and above frame is not empty
+            if len(dataframe) > 0:
+                # STEP 2 : Lines sequence of words are corrected
+                dataframe = self.line_num_correction(src_df=dataframe)
+                # STEP 3 : Word sequence horizontally are corrected
+                dataframe = self.word_num_corr(src_df=dataframe)
 
-            # writing result to json file for testing
-            # self.lookup_detections_df.to_json(self.result_dir + str(page_num) + '_detectionFrame.json')
-            dataframe_write['page_no'] = page_num
-            dataframe_write.to_json(self.result_dir + str(page_num) + '_df_excelFrame.json')
+                # step 4 : Column Model ran Above
+                # b. Idetify headers in the dataset
+                dataframe = self.identify_headers(dataframe, self.column_detection)
+                # c. Column min_max_creation --> new_col_lengths
+                dataframe, new_col_lengths, column_detection = self.column_creation(dataframe, self.column_detection)
+                dataframe = self.column_corr_final(dataframe, new_col_lengths)
+                dataframe['block_n'] = dataframe['col']
 
-            return pixel_dic, dataframe, dataframe_write, df_raw
+                # deleting all texts where block value is still -1
+                # Get indexes where name column doesn't have value
+                indexNames = dataframe[(dataframe['block_n'] == -1)].index
+                dataframe.drop(indexNames, inplace=True)
+
+                # STEP 4.a : Handling Multilines detected by model
+                orig_dataframe, dataframe = self.identify_cell_ids_with_multiline(src=dataframe)
+                # STEP 4.b : Handling Multiline part2
+                # since multiline is handled now using 'identify_overlap_of_det_along_y_axis' fnc above
+                # we will not run the below code to reidentify missed multilines
+                # dataframe = self.multiline_correction_final(dataframe)
+
+                # -------------------- RULE based multiline handle and EXCEL file write ----------------------
+                # dataframe_write is dataframe which is near perfect excel format
+                # STEP 5.a : Creating Frame like excel
+                dataframe_write = self.formatting_table_to_excel_like(src_frame=dataframe, page_no=page_num)
+                self.formatData = dataframe_write.copy()
+                # STEP 5.b : Handling Multiline with Rules
+
+
+            return pixel_dic, dataframe, dataframe_write, self.df_raw
 
     def pdf_to_page_df_2(self, pdfpath, UID, page_list, version='v2', result_save=False, save_result_dir='result'):
 
+        global logger
         self.source = UID
 
         # creating directory to save Results
-        self.result_dir = os.getcwd() +'/'+ save_result_dir
+        self.result_dir = os.getcwd() + '/' + save_result_dir + '/'
         os.makedirs(self.result_dir, exist_ok=True)
         print('\n*** NOTE : Results will be stored in location : ', self.result_dir, '\n')
+        logger.info('\t*** NOTE : Results will be stored in location : {} *********'.format(self.result_dir))
 
         # --------------------------------------  Deep Learning Model Initialization -------------------------------
         if self.table_model is None:
             self.model_init(model_name='mmdet', det='table')
         if self.cell_model is None:
             self.model_init(model_name='mmdet', det='cell')
+        if self.column_model is None:
+            self.model_init(model_name='mmdet', det='column')
+
         # ----------------------------------------------------------------------------------------------------------
 
         extra = {'request_id': 'UniqueRunId:' + str(UID)}
-        self.logger = logging.LoggerAdapter(self.logger, extra)
+        logger.info(extra)
+        logger.info(' Deep Learning Model output has a format as follows : [x0, y0, x1, y1, label, conf] ')
         self.doc = fitz.Document(pdfpath)
 
         page_info = {}
@@ -1256,7 +2507,7 @@ class PyMuPdf:
         for page_no in page_list:
             # calling the function where detection and processing takes place ---------------------------------
             pixel_dic, dataframe, excel_data, raw_df = self.pdf_to_page_df_mypypdf_intrim(page_num=page_no, result_save=result_save)
-            
+
             page_info.update({str(page_no): pixel_dic})
             final_df = final_df.append(dataframe, ignore_index=True)
             excel_df = excel_df.append(excel_data, ignore_index=True)
@@ -1276,11 +2527,20 @@ class PyMuPdf:
         return page_info, final_df, final_df_raw, excel_df, response_json
 
 
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\2020141.pdf'    # [38, 39, 40, 41]
-# pdf_file_path = r'D:\ForageAI\tables_project\table_cell\20207.pdf'    # [36, 38]
+pdf_file_path = r'D:\ForageAI\tables_project\table_cell\QA/2020141.pdf'    # [54,55,56,57,41,42,43,44,62,24,37,38,39,40,58,59,60,61,45,49]
+pdf_file_path = r'D:\ForageAI\tables_project\table_cell\20207.pdf'    # [36, 38]
+pdf_file_path = r'D:\ForageAI\tables_project\table_cell\202057.pdf'    # [69,71]
+#pdf_file_path = r'D:\ForageAI\tables_project\table_cell\202032.pdf'    # [34]
 obj = PyMuPdf()
 page_info, final_df, final_df_raw, excel_df, resp = obj.pdf_to_page_df_2(pdfpath=pdf_file_path, UID='1',
-                                                                   page_list=[54,55,56,57,41,42,43,44,62,24,37,38,39,40,58,59,60,61,45,49],
+                                                                   page_list=[69],
                                                                    result_save=True,
-                                                                   save_result_dir='2020141/')
+                                                                   save_result_dir='202057/')
+
+
+z= obj.formatData.copy()
+z.to_json('formatdf.json')
+
+#z2 = obj.lookup_detections_df.copy()
+#z2.to_json('detdf.json')
 

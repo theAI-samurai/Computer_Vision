@@ -17,6 +17,17 @@ import PIL.Image as Image
 from openpyxl.workbook import Workbook
 from openpyxl import load_workbook
 
+import pyodbc as pyodbc
+
+# ------------- SQL Database connection -----------------
+
+connect_string = 'DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};PORT=1443;DATABASE={database};UID={username};PWD={password}'.format(**details)
+connection = pyodbc.connect(connect_string,unicode_results = True)
+# Initialise the Cursor
+cursor = connection.cursor()
+
+#--------------------------------------------------------------
+
 warnings.filterwarnings('ignore')
 
 '''------------------------------------ Setting Logger --------------------------------'''
@@ -49,12 +60,13 @@ class PyMuPdf:
         self.source = None
         self.result_dir = None
         self.lookup_category_id_annotation_df = pd.DataFrame.from_dict(
-            {'category_id': [0, 1, 2, 3, 4, 5],
-             'name': ['semi_grided_table', 'grided_table', 'gridless_table', 'key_value', 'cell', 'special_cell'],
-             'supercategory': ['table', 'table', 'table', 'table', 'sentence', 'sentence']
+            {'category_id': [0, 1, 2, 3, 4, 5,6],
+             'name': ['semi_grided_table', 'grided_table', 'gridless_table', 'key_value', 'cell', 'special_cell', 'spanning_cell'],
+             'supercategory': ['table', 'table', 'table', 'table', 'sentence', 'sentence', 'sentence']
              })
 
         self.lookup_detections_df = None
+        self.column_detection = None
 
         self.cell_model = None
         self.cell_det_threshold = 0.8
@@ -64,6 +76,9 @@ class PyMuPdf:
         self.column_det_threshold = 0.9
 
         self.excel_dir = r'/home/ubuntu/Downloads/efs/4i/table_cell_service/'
+
+        self.db_status = None
+        #self.db_statement = "UPDATE documentspy SET status='"+self.db_status+"' where documentid="+str(self.source)
 
     def get_width(self, x0, x1):
         return int(x1-x0)
@@ -121,7 +136,7 @@ class PyMuPdf:
                 df = df.sort_values(['y', 'x'], ascending=True)
 
         df_ = pd.merge(df, ref_frame, how='left', left_on='label', right_on='name')
-
+        df_ = df_.drop_duplicates()
         return df_
 
     def get_undetected_parts_img(self, img_p, det_lst, page_num, save_img=True):
@@ -447,17 +462,24 @@ class PyMuPdf:
         det_tab = det_df.loc[det_df['supercategory'] == 'table']
         det_sen = det_df.loc[det_df['supercategory'] == 'sentence']
 
+        self.zdetsen = det_sen.copy()
+        self.zdettable= det_tab.copy()
+        self.zsupercopy = det_df_copy.copy()
+
+
         # removing all detections outside table
         # if sentence detections overlap with table coordinates we keep it else Removed
         for sind in det_sen.index:
+            to_drop = True
             R1 = [det_sen.loc[sind, 'x'], det_sen.loc[sind, 'y'], det_sen.loc[sind, 'x2'], det_sen.loc[sind, 'y2']]
             for tind in det_tab.index:
                 R2 = [det_tab.loc[tind, 'x'], det_tab.loc[tind, 'y'], det_tab.loc[tind, 'x2'], det_tab.loc[tind, 'y2']]
                 boo = self.isRectangleOverlap(R1, R2)
                 if boo is True:
-                    pass
-                else:
-                    det_df_copy.drop(sind, axis=0, inplace=True)
+                    # if overlap is true we do not want to drop this index , hence
+                    to_drop = False
+            if to_drop is True:
+                det_df_copy.drop(sind, inplace=True)
 
         # det_df_copy  --->  Cells detected by Model inside Table Frame
         det_df_copy.drop_duplicates(inplace=True)
@@ -563,7 +585,7 @@ class PyMuPdf:
         Return :
             df0             : updated input_df with overlap information of table or cell
         '''
-        df0 = input_df
+        df0 = input_df.copy()
         for i in range(len(det_df)):
             d_x = det_df.loc[i, 'x']
             d_y = det_df.loc[i, 'y']
@@ -864,7 +886,7 @@ class PyMuPdf:
                     val = src.loc[ind, c]
                     if not pd.isna(val):
                         val = val.strip().replace(',', '')
-                        val = val.strip.replace('$', '')
+                        val = val.strip().replace('$', '')
                         val = val.strip().replace('.', '')
                         try:
                             val = float(val)
@@ -944,8 +966,7 @@ class PyMuPdf:
                                                 src.loc[index, tc] = src.loc[index + 1, tc]
                                                 src.loc[index + 1, tc] = np.nan
                                             rows_with_nan_processed.append(ele)
-                    if int(
-                            ele) - 1 not in rows_with_nan_n_num_only and ele not in rows_with_nan_n_num_n_str and ele not in rows_with_nan_processed:
+                    if int(ele) - 1 not in rows_with_nan_n_num_only and ele not in rows_with_nan_n_num_n_str and ele not in rows_with_nan_processed:
                         # all such cells will be merged up
                         if ele != 0:  # if index or ele is 0 there is no chance of merging it above
                             for tc in col:
@@ -962,7 +983,7 @@ class PyMuPdf:
                                 src.loc[ele - 1, tc] = text1 + text2
                                 src.loc[ele, tc] = np.nan
                             rows_with_nan_processed.append(ele)
-
+                            self.db_status = 'ML_handled'
                     if int(ele) - 1 not in rows_with_nan_n_num_only and ele not in rows_with_nan_processed:
                         if ele in rows_with_nan_n_num_n_str:
                             if int(ele) - 1 in rows_with_nan and int(ele) - 2 in rows_with_nan and int(
@@ -978,8 +999,10 @@ class PyMuPdf:
                                     src.loc[ele - 2, tc] = str(text1) + str(text2)
                                     src.loc[ele, tc] = np.nan
                                 rows_with_nan_processed.append(ele)
+                                self.db_status = 'ML_handled'
         except:
-            pass
+            if self.db_status is None:
+                self.db_status = 'ML_holdoff'
         src.dropna(axis=0, how='all', inplace=True)
         src.reset_index(drop=True, inplace=True)
         return src
@@ -1929,6 +1952,11 @@ class PyMuPdf:
         im_resized = img.resize(size, Image.ANTIALIAS)
         open_cv_image = np.array(im_resized)
         open_cv_image = open_cv_image[:, :, ::-1].copy()                    # Convert RGB to BGR
+
+        # converting image to binary
+        #img = np.where(open_cv_image > 200, 255, 0)
+        #open_cv_image = cv2.merge((img, img, img))
+
         image_name = self.result_dir + str(page_num) + '.jpeg'              # file path
         cv2.imwrite(image_name, open_cv_image)                              # Saving file
 
@@ -2139,8 +2167,8 @@ class PyMuPdf:
             final_df_raw = final_df_raw.append(raw_df, ignore_index=True)
 
             # Response
-            #table_data = excel_data.to_dict()
-            #Table_data.append({'page_no': page_no, 'table_json': table_data})
+            table_data = excel_data.to_dict()
+            Table_data.append({'page_no': page_no, 'table_json': table_data})
 
         response_json.update({'page_data': final_df.to_json(orient='split'),
                               'page_excel_data': excel_df.to_json(orient='split'),
@@ -2148,18 +2176,26 @@ class PyMuPdf:
                               'Table_data': Table_data,
                               'status_code': 100,
                               "message": "Success..!"})
+        if self.db_status is None:
+            self.db_status = 'ML_ready'
+        self.db_statement = "UPDATE documentspy SET status='" + self.db_status + "' where documentid=" + str(
+            self.source)
+        cursor.execute(self.db_statement)
 
         return page_info, final_df, final_df_raw, excel_df, response_json
 
 
 pdf_file_path = r'D:\ForageAI\tables_project\table_cell\2020141.pdf'    # [54,55,56,57,41,42,43,44,62,24,37,38,39,40,58,59,60,61,45,49]
 pdf_file_path = r'D:\ForageAI\tables_project\table_cell\202017.pdf'
+pdf_file_path = r'D:\ForageAI\tables_project\table_cell\202057.pdf'    # [36, 38]
+pdf_file_path = r'D:\ForageAI\tables_project\table_cell\20203340.pdf'    # [36, 38]
+
 pdf_file_path = pdf_file_path.replace("\\", "/")
 resul_dir = pdf_file_path.split('/')[-1].split('.')[0]
 obj = PyMuPdf()
 page_info, final_df, final_df_raw, excel_df, resp = obj.pdf_to_page_df_2(pdfpath=pdf_file_path, UID=resul_dir,
-                                                                   page_list=[41],
+                                                                   page_list=[6],
                                                                    result_save=True,
-                                                                   save_result_dir='pdf_to_excel_output/'+resul_dir)
+                                                                   save_result_dir='pdf_to_excel_output_/'+resul_dir)
 
 
