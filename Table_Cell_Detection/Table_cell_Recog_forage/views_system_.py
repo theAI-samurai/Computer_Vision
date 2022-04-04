@@ -27,10 +27,7 @@ import pyodbc as pyodbc
 
 # ------------- SQL Database connection -----------------
 details = {
-'server': 'forage-automation-db.cod4levdfbtz.ap-south-1.rds.amazonaws.com',
-'database': 'PensionsML',
-'username': 'master',
-'password': 'A4tOmat!0nK3y'
+
  }
 connect_string = 'DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};PORT=1443;DATABASE={database};UID={username};PWD={password}'.format(**details)
 connection = pyodbc.connect(connect_string,unicode_results = True)
