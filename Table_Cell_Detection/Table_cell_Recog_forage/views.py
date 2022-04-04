@@ -31,7 +31,12 @@ from openpyxl import load_workbook
 import pyodbc as pyodbc
 
 # ------------- SQL Database connection -----------------
-
+details = {
+'server': 'forage-automation-db.cod4levdfbtz.ap-south-1.rds.amazonaws.com',
+'database': 'PensionsML',
+'username': 'master',
+'password': 'A4tOmat!0nK3y'
+ }
 connect_string = 'DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};PORT=1443;DATABASE={database};UID={username};PWD={password}'.format(**details)
 connection = pyodbc.connect(connect_string,unicode_results = True)
 # Initialise the Cursor
@@ -2648,17 +2653,56 @@ class PyMuPdf:
         dataframe = pd.DataFrame.from_records(word, columns=labels)
         dataframe['page_number'] = page_num
 
-        # dataframe['x0'] = dataframe['x0'] + 5
-        # dataframe['x1'] = dataframe['x1'] + 30
-        # dataframe['y0'] = dataframe['y0'] + 30
-        # dataframe['y1'] = dataframe['y1'] + 30
-        # self.testdfBasic0 = dataframe.copy()
-
-        dataframe.rename(columns={'x0': 'x', 'y0': 'y', 'x1': 'w', 'y1': 'h', 'page_number': 'page_number', 'word': 'text'}, inplace=True)
-
         if word:
             w_fact = int(2961) / page_width
             h_fact = int(4016) / page_height
+
+            # ---------------------------------------------------
+            if page_width > page_height:
+                toRotate = False
+                toRotateList = []
+                img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+                size = page_width, page_height  # w-612 , h-792
+                img = img.resize(size, Image.ANTIALIAS)
+                img = np.array(img)
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+                img = np.where(img > 200, 255, 0)
+                index_five = dataframe.index[0:5].tolist()
+                # cropping for 5 index to check if coordinates need to be rotated or not
+                for i in index_five:
+                    y0 = int(dataframe.loc[i, 'y0'])
+                    y1 = int(dataframe.loc[i, 'y1'])
+                    x0 = int(dataframe.loc[i, 'x0'])
+                    x1 = int(dataframe.loc[i, 'x1'])
+                    crop_img = img[y0:y1, x0:x1]
+                    per_num_white_pix = (np.sum(crop_img == 255) / crop_img.size) * 100
+                    per_num_black_pix = (np.sum(crop_img == 0) / crop_img.size) * 100
+                    if per_num_white_pix > 80:
+                        toRotateList.append(True)
+                    else:
+                        toRotateList.append(False)
+                if toRotateList.count(True) > 2:
+                    toRotate = True
+                if toRotate:
+                    print('Rotating the pixel values')
+                    # rotating 90 degree clockwise
+
+                    y0_list = dataframe['x0'].tolist()
+                    y1_list = dataframe['x1'].tolist()
+                    x0_list = dataframe['y1']
+                    x1_list = dataframe['y0']
+
+                    x0_list = [792 - i for i in x0_list]
+                    x1_list = [792 - i for i in x1_list]
+
+                    # reassigning values
+                    dataframe['x0'] = x0_list
+                    dataframe['x1'] = x1_list
+                    dataframe['y0'] = y0_list
+                    dataframe['y1'] = y1_list
+            # -------------------------------------------------
+
+            dataframe.rename(columns={'x0': 'x', 'y0': 'y', 'x1': 'w', 'y1': 'h', 'page_number': 'page_number', 'word': 'text'},inplace=True)
 
             dataframe['w'] = dataframe.apply(lambda row: self.get_width(row['x'], row['w']), axis=1)
             dataframe['h'] = dataframe.apply(lambda row: self.get_heigth(row['y'], row['h']), axis=1)
