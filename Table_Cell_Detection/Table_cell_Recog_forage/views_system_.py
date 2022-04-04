@@ -26,7 +26,12 @@ from openpyxl import load_workbook
 import pyodbc as pyodbc
 
 # ------------- SQL Database connection -----------------
-
+details = {
+'server': 'forage-automation-db.cod4levdfbtz.ap-south-1.rds.amazonaws.com',
+'database': 'PensionsML',
+'username': 'master',
+'password': 'A4tOmat!0nK3y'
+ }
 connect_string = 'DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};PORT=1443;DATABASE={database};UID={username};PWD={password}'.format(**details)
 connection = pyodbc.connect(connect_string,unicode_results = True)
 # Initialise the Cursor
@@ -2535,17 +2540,56 @@ class PyMuPdf:
         dataframe = pd.DataFrame.from_records(word, columns=labels)
         dataframe['page_number'] = page_num
 
-        # dataframe['x0'] = dataframe['x0'] + 5
-        # dataframe['x1'] = dataframe['x1'] + 30
-        # dataframe['y0'] = dataframe['y0'] + 30
-        # dataframe['y1'] = dataframe['y1'] + 30
-        # self.testdfBasic0 = dataframe.copy()
-
-        dataframe.rename(columns={'x0': 'x', 'y0': 'y', 'x1': 'w', 'y1': 'h', 'page_number': 'page_number', 'word': 'text'}, inplace=True)
-
         if word:
             w_fact = int(2961) / page_width
             h_fact = int(4016) / page_height
+
+            # ---------------------------------------------------
+            if page_width > page_height:
+                toRotate = False
+                toRotateList = []
+                img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+                size = page_width, page_height  # w-612 , h-792
+                img = img.resize(size, Image.ANTIALIAS)
+                img = np.array(img)
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+                img = np.where(img > 200, 255, 0)
+                index_five = dataframe.index[0:5].tolist()
+                # cropping for 5 index to check if coordinates need to be rotated or not
+                for i in index_five:
+                    y0 = int(dataframe.loc[i, 'y0'])
+                    y1 = int(dataframe.loc[i, 'y1'])
+                    x0 = int(dataframe.loc[i, 'x0'])
+                    x1 = int(dataframe.loc[i, 'x1'])
+                    crop_img = img[y0:y1, x0:x1]
+                    per_num_white_pix = (np.sum(crop_img == 255) / crop_img.size) * 100
+                    per_num_black_pix = (np.sum(crop_img == 0) / crop_img.size) * 100
+                    if per_num_white_pix > 80:
+                        toRotateList.append(True)
+                    else:
+                        toRotateList.append(False)
+                if toRotateList.count(True) > 2:
+                    toRotate = True
+                if toRotate:
+                    print('Rotating the pixel values')
+                    # rotating 90 degree clockwise
+
+                    y0_list = dataframe['x0'].tolist()
+                    y1_list = dataframe['x1'].tolist()
+                    x0_list = dataframe['y1']
+                    x1_list = dataframe['y0']
+
+                    x0_list = [792 - i for i in x0_list]
+                    x1_list = [792 - i for i in x1_list]
+
+                    # reassigning values
+                    dataframe['x0'] = x0_list
+                    dataframe['x1'] = x1_list
+                    dataframe['y0'] = y0_list
+                    dataframe['y1'] = y1_list
+            # -------------------------------------------------
+
+            dataframe.rename(columns={'x0': 'x', 'y0': 'y', 'x1': 'w', 'y1': 'h', 'page_number': 'page_number', 'word': 'text'},inplace=True)
 
             dataframe['w'] = dataframe.apply(lambda row: self.get_width(row['x'], row['w']), axis=1)
             dataframe['h'] = dataframe.apply(lambda row: self.get_heigth(row['y'], row['h']), axis=1)
@@ -2626,13 +2670,8 @@ class PyMuPdf:
                 # ------------------ trying to get possible multiline based on detetctions formed -------------
                 # Now we again modify the detections based on possible multiline
                 # given that model identifies atleast one such mltiline
-                self.testA = dataframe.copy()
-                self.testB = self.lookup_detections_df.copy()
 
                 dataframe, self.lookup_detections_df = self.identify_overlap_of_det_along_y_axis(det=self.lookup_detections_df, input_df=dataframe)
-
-                self.testAa = dataframe.copy()
-                self.testBb = self.lookup_detections_df.copy()
 
                 image_name_ = self.result_dir + str(page_num) + 'allDetections.jpeg'
                 self.draw_detetion_save_img(self.lookup_detections_df, image_name_, page_num, name_of_file='allDetections.jpeg', result_save=result_save, color=(0, 0, 255))
@@ -2767,28 +2806,13 @@ class PyMuPdf:
         return page_info, final_df, final_df_raw, excel_df, response_json, self.db_status
 
 
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\QA/2020141.pdf'    # [54,55,56,57,41,42,43,44,62,24,37,38,39,40,58,59,60,61,45,49]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\20207.pdf'    # [36, 38]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\202057.pdf'    # [69,71]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\202032.pdf'    # [34]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\202017.pdf'    # [41]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\2020134.pdf'    # [41]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\20203342.pdf'    # [41]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\2020358.pdf'    # [36, 38]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\20201109.pdf'    # [36, 37, 38, 42, 43, 44]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\202010268.pdf'    # [32]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\2020245.pdf'      # [ 33, 34]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\20201493.pdf'      # [ 32, 33]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\20201467.pdf'      # [ 32, 33]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\20201496.pdf'      # [ 43,44]
-# pdf_file_path = r'D:\ForageAI\tables_project\table_cell\202010044.pdf'      # [ 43,44]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\202010663.pdf'      # [ 43,44]
-pdf_file_path = r'D:\ForageAI\tables_project\table_cell\2020674.pdf'      # [ 43,44]
+pdf_file_path = r'D:\ForageAI\tables_project\table_cell\202010044.pdf'      # [ 21,22,31,32,33]
+pdf_file_path = r'D:\ForageAI\tables_project\table_cell\20201496.pdf'      # []
 pdf_file_path = pdf_file_path.replace("\\", "/")
 resul_dir = pdf_file_path.split('/')[-1].split('.')[0]
 obj = PyMuPdf()
 page_info, final_df, final_df_raw, excel_df, resp,dbsta = obj.pdf_to_page_df_2(pdfpath=pdf_file_path, UID=resul_dir,
-                                                                   page_list=[34],
+                                                                   page_list=[32,33,42,43,44],
                                                                    result_save=True,
                                                                    save_result_dir='pdf_to_excel_output_/'+resul_dir)
 
