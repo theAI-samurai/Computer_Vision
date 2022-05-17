@@ -15,6 +15,7 @@ import fitz
 import cv2
 import pandas as pd
 import numpy as np
+import json
 import os
 import shutil
 import io
@@ -22,7 +23,6 @@ from pathlib import Path
 import warnings
 import logging
 import pickle
-import json
 import PIL.Image as Image
 
 from openpyxl.workbook import Workbook
@@ -35,6 +35,7 @@ import xml.etree.cElementTree as ET
 
 # ------------- SQL Database connection -----------------
 details = {
+
  }
 connect_string = 'DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};PORT=1443;DATABASE={database};UID={username};PWD={password}'.format(**details)
 connection = pyodbc.connect(connect_string,unicode_results = True)
@@ -143,7 +144,7 @@ class PyMuPdf:
         df = pd.DataFrame(columns=['id','x', 'y', 'w', 'h', 'x2', 'y2', 'label'])
         for d in det_lst:
             x1, y1, x2, y2, label, conf = d
-            if conf> 0.8:
+            if conf> 0.7:
                 df = df.append({'x': x1, 'y': y1, 'w': x2 - x1, 'h': y2 - y1, 'x2': x2, 'y2': y2, 'label': label, 'conf':conf}, ignore_index=True)
                 df = df.sort_values(['y', 'x'], ascending=True)
 
@@ -903,7 +904,119 @@ class PyMuPdf:
         src = self.line_num_correction(src)
         return df_copy, src
 
-    def identify_cell_ids_with_multiline(self, src):
+    def check_overmerge_of_numerical_col(self, dic0, lst0, dfmul0):
+        report_cell_ids = {False: [], True: []}
+        done = []
+        for cellid in dic0.keys():
+            olpids = dic0[cellid].copy()
+            done.extend(olpids)
+            olpids.extend([cellid])
+            if cellid not in done:
+                # ----------------------------------------------------
+                # by default we assume since its multiline we merge
+                # therefore toMerge = True
+                toMerge = True
+                ctr = 0
+                # -----------------------------------------------------
+                done.append(cellid)
+                allindextoconsider = []
+                for ids in olpids:
+                    ind = lst0[ids].copy()
+                    allindextoconsider.extend(ind)
+                tempFrame = dfmul0.loc[allindextoconsider]
+                tempFrame.sort_values(by=['block_n', 'y', 'x'], inplace=True)
+                uniqblock = tempFrame['block_n'].unique().tolist()
+                uniqblock.sort(reverse=True)
+                for blk in uniqblock:
+                    if toMerge is True:
+                        subtempFrame = tempFrame.loc[tempFrame['block_n'] == blk]
+                        # we try to identify if there is number in the multiline that might get merged with other number
+                        # if yes we seprate the annotations
+                        for indexnum in subtempFrame.index:
+                            textval = str(subtempFrame.loc[indexnum, 'text'])
+                            textval = textval.replace(',', '')
+                            textval = textval.replace('.', '')
+                            textval = textval.replace('$', '')
+                            textval = textval.strip()
+                            try:
+                                textval = int(textval)
+                                if isinstance(textval, (int, float, complex)):
+                                    ctr = ctr + 1
+                            except:
+                                pass
+                        if ctr > 1:
+                            toMerge = False
+                if toMerge is True:
+                    rep_val = report_cell_ids[True]
+                    rep_val.extend(olpids)
+                    report_cell_ids.update({True: rep_val})
+                else:
+                    rep_val = report_cell_ids[False]
+                    rep_val.extend(olpids)
+                    report_cell_ids.update({False: rep_val})
+        return report_cell_ids
+
+    def clear_overmerge_update_det_n_df(self, srcdf, reportids, lookupdetframe):
+        val = reportids[False]
+        if len(val) > 0:
+            for id in val:
+                tempFrame = srcdf.loc[srcdf['cell_id'] == id]
+                unique_y = tempFrame['y'].unique()
+                for ys in unique_y:
+                    subtempframe = tempFrame.loc[tempFrame['y'] == ys]
+                    newid = max(lookupdetframe['id']) + 1
+                    new_x = min(min(subtempframe['c_x']), min(subtempframe['x']))
+                    new_w = max(subtempframe['c_w'])
+                    new_x2 = new_x + new_w
+                    new_y = max(min(subtempframe['c_y']), min(subtempframe['y']))
+                    new_h = max(subtempframe['h'])
+                    new_y2 = new_y + new_h
+                    lookupdetframe = lookupdetframe.append({'x': new_x, 'y': new_y, 'w': new_w, 'h': new_h,
+                                                            'x2': new_x2, 'y2': new_y2, 'label': 'cell',
+                                                            'category_id': 4, 'name': 'cell',
+                                                            'supercategory': 'sentence',
+                                                            'id': newid, 'conf': 2, 'overlap': -1},
+                                                           ignore_index=True)
+                    for ind in subtempframe.index:
+                        srcdf.loc[ind, 'c_x'] = new_x
+                        srcdf.loc[ind, 'c_y'] = new_y
+                        srcdf.loc[ind, 'c_w'] = new_w
+                        srcdf.loc[ind, 'c_h'] = new_h
+                        srcdf.loc[ind, 'cell_id'] = newid
+
+        for v in val:
+            lookupdetframe.drop(lookupdetframe[lookupdetframe['id'] == v].index, inplace=True)
+        lookupdetframe.reset_index(drop=True, inplace=True)
+        return srcdf, lookupdetframe
+
+    def relation_between_multiline_cell_ids_corrected(self, cellolap_dic, cell_multLine_index, srcdf):
+        """
+        we aim to include cell ids in cell_multLine_index dictoionary, where
+        though the cell id is not multiline, there is a y-axis overlap with cell_ids that are multiline.
+        """
+        allcellids = []
+        for id in cellolap_dic.keys():
+            val = cellolap_dic[id]
+            allcellids.extend(val)
+            allcellids.extend([id])
+        allcellids = list(set(allcellids))
+
+        for val in allcellids:
+            if val in cell_multLine_index.keys():
+                pass
+            else:
+                temp_sup = srcdf.loc[srcdf['cell_id'] == val]
+                temp_sup = temp_sup.reset_index(drop=False)
+                cell_multLine_index.update({val: list(temp_sup['index'])})
+
+        for id in cell_multLine_index.keys():
+            if id in cellolap_dic.keys():
+                pass
+            else:
+                cellolap_dic.update({id: []})
+        return cellolap_dic, cell_multLine_index
+
+    def identify_cell_ids_with_multiline(self, src, lookupdet):
         '''
         Modification made :
             1. Lst is now a Dict and contains cell id and rows index to merge
@@ -933,8 +1046,17 @@ class PyMuPdf:
                         if temp.loc[i, 'line_n'] != temp.loc[i + 1, 'line_n']:
                             lst.update({id_: list(temp['index'])})
 
-        # olap_dic_  -----> is a dictionary where 'cell_id' is KEY & cellIDs with which there is y-axis overlaps is VALUE
+        # olap_dic_ -----> is a dictionary where 'cell_id' is KEY & cellIDs with which there is y-axis overlaps is VALUE
         olap_dic_ = self.identify_overlap_det_y_axis_multiline(df_copy, cell_id_uniq, lst)
+        olap_dic_, lst = self.relation_between_multiline_cell_ids_corrected(olap_dic_, lst, src)
+        report_multiline_issue_ids = self.check_overmerge_of_numerical_col(olap_dic_, lst, df_copy)
+        src, lookupdetf = self.clear_overmerge_update_det_n_df(src, report_multiline_issue_ids, lookupdet)
+
+        for v in report_multiline_issue_ids[False]:
+            del lst[v]
+
+        src[['x', 'y', 'w', 'h', 'c_x', 'c_y', 'c_w', 'c_h', 'line_n', 'block_n', 'word_n','page_number','source', 'is_in_table', 'table_id', 't_x', 't_y', 't_w', 't_h', 'is_in_cell', 'cell_id', 'header', 'col']] = src[['x', 'y', 'w', 'h', 'c_x', 'c_y', 'c_w', 'c_h', 'line_n', 'block_n', 'word_n','page_number','source', 'is_in_table', 'table_id', 't_x', 't_y', 't_w', 't_h', 'is_in_cell', 'cell_id', 'header', 'col']].apply(pd.to_numeric)
+
         for ids in lst.keys():
             temp = src.loc[lst[ids]]
             temp = temp.sort_values(by=['y', 'x'])
@@ -978,7 +1100,7 @@ class PyMuPdf:
 
         # re arranging the line no after dropping empty text lines
         src = self.line_num_correction(src)
-        return df_copy, src
+        return df_copy, src, lookupdetf
 
     def multiline_correction_final(self, input_df):
         src = input_df.copy()
@@ -1113,6 +1235,7 @@ class PyMuPdf:
         # 1. all values in row is nan except 1, and row following that is also nan, merge up
         # 2.  all values in row is nan except 1, and row above it is in rows_with_nan
         rows_with_nan = list(set(rows_with_nan))
+        rows_with_nan.sort()
         rows_with_nan_processed = []  # to keep track of processed indexes
 
         # processing rows having a Nan Value
@@ -1188,7 +1311,10 @@ class PyMuPdf:
                             if not pd.isna(val):
                                 col_of_interest = c
                                 # get value in Row below
-                                val_next = src.loc[ele + 1, col_of_interest]
+                                try:
+                                    val_next = src.loc[ele + 1, col_of_interest]
+                                except:
+                                    val_next = ''
                                 try:
                                     val_next = val_next.strip()
                                     is_char_lower = val_next[0].islower()
@@ -1267,8 +1393,14 @@ class PyMuPdf:
                             # ---- update 21-04-2022 -----
                             # merging 'ele' with 'ele-1' if ele starts with lower case and does not have words like :
                             # 'total', 'sum', 'amount
+                            # likewise we also chaeck if any col have both text starting with Caps or
+                            # both rows have numeric value present
+
                             isUpFlag = False
+                            flag_list_for_all_cols = []
+                            isUpFlaglist = []
                             text_to_put_if_isUpFlag = []
+
                             if ele != 0:  # if index or ele is 0 there is no chance of merging it above
                                 for tc in col:
                                     try:
@@ -1277,19 +1409,51 @@ class PyMuPdf:
                                         text1 = ''
                                     if pd.isna(text1):
                                         text1 = ''
+                                        text1isUpper = False
+                                        text1isNumeric = False
                                     else:
                                         text1 = str(text1).strip()
+                                        if len(text1) > 0:
+                                            text1isUpper = text1[0].isupper()
+                                        else:
+                                            text1isUpper = False
+                                        text1isNumeric = text1.replace('.', '').isnumeric()
 
                                     text2 = src.loc[ele, tc]
                                     if pd.isna(text2):
                                         text2 = ''
+                                        text2isUpper = False
+                                        text2isNumeric = False
+                                        checkIsLower = False
+                                        check_specific_words = False
                                     else:
                                         text2 = str(text2).strip()
+                                        if len(text2) > 0:
+                                            text2isUpper = text2[0].isupper()
+                                        else:
+                                            text2isUpper = False
+                                        text2isNumeric = text2.replace('.', '').isnumeric()
                                         checkIsLower = text2[0].islower()
                                         check_specific_words = ('total' not in text2) and ('Total' not in text2)
-                                        if isUpFlag is False:
-                                            isUpFlag = checkIsLower and check_specific_words
+
+                                        isUpFlagCol = checkIsLower and check_specific_words
+                                        isUpFlaglist.append(isUpFlagCol)
+
+                                    isupper_or_numeric_value_flag = (text1isUpper and text2isUpper) or (text1isNumeric and text2isNumeric)
+                                    flag_list_for_all_cols.append(isupper_or_numeric_value_flag)
                                     text_to_put_if_isUpFlag.append(text1 + ' ' + text2)
+
+                                if isUpFlag is False:
+                                    if True in flag_list_for_all_cols:
+                                        cond1 = False
+                                    else:
+                                        cond1 = True
+                                    if True in isUpFlaglist:
+                                        cond2 = True
+                                    else:
+                                        cond2 = False
+                                    isUpFlag = cond1 and cond2
+
                                 if isUpFlag and ele - 1 in src.index:
                                     for ier, tc in enumerate(col):
                                         src.loc[ele - 1, tc] = text_to_put_if_isUpFlag[ier]
@@ -2211,8 +2375,8 @@ class PyMuPdf:
                 self.cell_model = init_detector(config_cell_detection, weights_path_cell_detection, device='cpu')
 
             elif det.lower() in ['table', 'tables']:
-                weights_path_table_detection = str(ROOT) + '/table_cell_config/table_cascadeRCNN_epoch_20.pth'
-                config_table_detection = str(ROOT) + '/mmdet/configs/cascade_rcnn/cascade_rcnn_r101_fpn_1x_coco_custom.py'
+                weights_path_table_detection = str(ROOT) + '/table_cell_config/table_cascadeRCNN_epoch_29.pth'
+                config_table_detection = str(ROOT) + '/mmdet/configs/cascade_rcnn/cascade_rcnn_r101_fpn_1x_coco_custom_table_09May_22.py'
 
                 print('\n****** Looking for Table Model Files at following path ****** ')
                 print('WEIGHTS file path    : ', weights_path_table_detection)
@@ -2311,7 +2475,7 @@ class PyMuPdf:
             if cls_label in ['cell', 'special_cell'] and conf > self.cell_det_threshold:
                 temp = [x1, y1, x2, y2, cls_label, conf]
                 new_pred.append(temp)
-            if cls_label in ['gridless_table', 'grided_table', 'semi_grided_table', 'key_value'] and conf > self.table_det_threshold:
+            if (cls_label in ['gridless_table', 'grided_table', 'semi_grided_table', 'key_value']) and (conf > self.table_det_threshold):
                 temp = [x1, y1, x2, y2, cls_label, conf]
                 new_pred.append(temp)
             else:
@@ -2399,73 +2563,92 @@ class PyMuPdf:
         df_y_copy['new_y'] = -1
         df_y_copy['new_y2'] = -1
 
+        skip_processing = []
         for i in range(1, len(df_y)):
-            flag = -1
-            pre_y2 = df_y.loc[i - 1, 'y2']
-            crr_y = df_y.loc[i, 'y']
-            crr_y2 = df_y.loc[i, 'y2']
-            if i + 1 in df_y.index:
-                next_y = df_y.loc[i + 1, 'y']
-            else:
-                next_y = None
-
-            if pre_y2 > crr_y:
-                if (next_y is not None) and (crr_y2 > next_y):
-                    # percentage overlap with previous y-y2
-                    per_overlap_prev = (pre_y2 - crr_y) / (crr_y2 - crr_y)
-                    per_overlap_next = (crr_y2 - next_y) / (crr_y2 - crr_y)
-
-                    if per_overlap_prev > 0.5:
-                        df_y_copy.loc[i, 'new_y'] = crr_y
-                        df_y_copy.loc[i, 'new_y2'] = pre_y2
-                        df_y.loc[i, 'y'] = crr_y
-                        df_y.loc[i, 'y2'] = pre_y2
-                        df_y.loc[i, 'h'] = pre_y2 - crr_y
-                        flag = 1
-                    if per_overlap_next > 0.5:
-                        df_y_copy.loc[i, 'new_y'] = next_y
-                        df_y_copy.loc[i, 'new_y2'] = crr_y2
-                        df_y.loc[i, 'y'] = next_y
-                        df_y.loc[i, 'y2'] = crr_y2
-                        df_y.loc[i, 'h'] = crr_y2 - next_y
-                        flag = 1
-                    elif flag < 0:
-                        df_y_copy.loc[i, 'new_y'] = max(pre_y2, crr_y) + 2
-                        df_y_copy.loc[i, 'new_y2'] = min(next_y, crr_y2) - 2
-                        df_y.loc[i, 'y'] = max(pre_y2, crr_y) + 2
-                        df_y.loc[i, 'y2'] = min(next_y, crr_y2) - 2
-                        df_y.loc[i, 'h'] = (min(next_y, crr_y2) - 2) - (max(pre_y2, crr_y) + 2)
-                        flag = 1
+            if i not in skip_processing:
+                flag = -1
+                pre_y2 = df_y.loc[i - 1, 'y2']
+                crr_y = df_y.loc[i, 'y']
+                crr_y2 = df_y.loc[i, 'y2']
+                if i + 1 in df_y.index:
+                    next_y = df_y.loc[i + 1, 'y']
                 else:
-                    new_pre_y2 = min(pre_y2, crr_y) - 3
-                    new_crr_y = max(pre_y2, crr_y) + 4
+                    next_y = None
 
-                    df_y_copy.loc[i, 'new_y'] = new_crr_y
-                    df_y_copy.loc[i - 1, 'new_y2'] = new_pre_y2
+                if pre_y2 > crr_y:
+                    if (next_y is not None) and (crr_y2 > next_y):
+                        # percentage overlap with previous y-y2
+                        finalize_overlap_btw_prev_next = None
+                        per_overlap_prev = (pre_y2 - crr_y) / (crr_y2 - crr_y)
+                        per_overlap_next = (crr_y2 - next_y) / (crr_y2 - crr_y)
 
-                    flag = 1
+                        if (per_overlap_prev > 0.5) and (per_overlap_next > 0.5):
+                            if per_overlap_next > per_overlap_prev:
+                                finalize_overlap_btw_prev_next = 'per_overlap_next'
+                            elif per_overlap_prev > per_overlap_next:
+                                finalize_overlap_btw_prev_next = 'per_overlap_prev'
+                            elif per_overlap_prev == per_overlap_next:
+                                finalize_overlap_btw_prev_next = 'per_overlap_next'
+                        else:
+                            if per_overlap_next > per_overlap_prev:
+                                finalize_overlap_btw_prev_next = 'per_overlap_next'
+                            elif per_overlap_prev > per_overlap_next:
+                                finalize_overlap_btw_prev_next = 'per_overlap_prev'
 
-            # adjusting h value too
-            if flag > 0:
-                # 1. doing for i
-                if df_y_copy.loc[i, 'new_y'] > 0:
-                    if df_y_copy.loc[i, 'new_y2'] > 0:
-                        df_y_copy.loc[i, 'h'] = df_y_copy.loc[i, 'new_y2'] - df_y_copy.loc[i, 'new_y']
+                        if (per_overlap_prev > 0.5) and (finalize_overlap_btw_prev_next=='per_overlap_prev'):
+                            df_y_copy.loc[i, 'new_y'] = crr_y
+                            df_y_copy.loc[i, 'new_y2'] = pre_y2
+                            df_y.loc[i, 'y'] = crr_y
+                            df_y.loc[i, 'y2'] = pre_y2
+                            df_y.loc[i, 'h'] = pre_y2 - crr_y
+                            flag = 1
+                        if (per_overlap_next > 0.5) and (finalize_overlap_btw_prev_next=='per_overlap_next'):
+                            df_y_copy.loc[i, 'new_y'] = next_y
+                            df_y_copy.loc[i, 'new_y2'] = crr_y2
+                            df_y.loc[i, 'y'] = next_y
+                            df_y.loc[i, 'y2'] = crr_y2
+                            df_y.loc[i, 'h'] = crr_y2 - next_y
+                            df_y.loc[i + 1, 'y2'] = crr_y2
+                            df_y.loc[i + 1, 'h'] = crr_y2 - next_y
+                            flag = 1
+                            skip_processing.append(i + 1)
+                        elif flag < 0:
+                            df_y_copy.loc[i, 'new_y'] = max(pre_y2, crr_y) + 2
+                            df_y_copy.loc[i, 'new_y2'] = min(next_y, crr_y2) - 2
+                            df_y.loc[i, 'y'] = max(pre_y2, crr_y) + 2
+                            df_y.loc[i, 'y2'] = min(next_y, crr_y2) - 2
+                            df_y.loc[i, 'h'] = (min(next_y, crr_y2) - 2) - (max(pre_y2, crr_y) + 2)
+                            flag = 1
                     else:
-                        df_y_copy.loc[i, 'h'] = df_y_copy.loc[i, 'y2'] - df_y_copy.loc[i, 'new_y']
-                else:
-                    if df_y_copy.loc[i, 'new_y2'] > 0:
-                        df_y_copy.loc[i, 'h'] = df_y_copy.loc[i, 'new_y2'] - df_y_copy.loc[i, 'y']
+                        new_pre_y2 = min(pre_y2, crr_y) - 3
+                        new_crr_y = max(pre_y2, crr_y) + 4
 
-                # 2. doing for i-1
-                if df_y_copy.loc[i - 1, 'new_y'] > 0:
-                    if df_y_copy.loc[i - 1, 'new_y2'] > 0:
-                        df_y_copy.loc[i - 1, 'h'] = df_y_copy.loc[i - 1, 'new_y2'] - df_y_copy.loc[i - 1, 'new_y']
+                        df_y_copy.loc[i, 'new_y'] = new_crr_y
+                        df_y_copy.loc[i - 1, 'new_y2'] = new_pre_y2
+
+                        flag = 1
+
+                # adjusting h value too
+                if flag > 0:
+                    # 1. doing for i
+                    if df_y_copy.loc[i, 'new_y'] > 0:
+                        if df_y_copy.loc[i, 'new_y2'] > 0:
+                            df_y_copy.loc[i, 'h'] = df_y_copy.loc[i, 'new_y2'] - df_y_copy.loc[i, 'new_y']
+                        else:
+                            df_y_copy.loc[i, 'h'] = df_y_copy.loc[i, 'y2'] - df_y_copy.loc[i, 'new_y']
                     else:
-                        df_y_copy.loc[i - 1, 'h'] = df_y_copy.loc[i - 1, 'y2'] - df_y_copy.loc[i - 1, 'new_y']
-                else:
-                    if df_y_copy.loc[i - 1, 'new_y2'] > 0:
-                        df_y_copy.loc[i - 1, 'h'] = df_y_copy.loc[i - 1, 'new_y2'] - df_y_copy.loc[i - 1, 'y']
+                        if df_y_copy.loc[i, 'new_y2'] > 0:
+                            df_y_copy.loc[i, 'h'] = df_y_copy.loc[i, 'new_y2'] - df_y_copy.loc[i, 'y']
+
+                    # 2. doing for i-1
+                    if df_y_copy.loc[i - 1, 'new_y'] > 0:
+                        if df_y_copy.loc[i - 1, 'new_y2'] > 0:
+                            df_y_copy.loc[i - 1, 'h'] = df_y_copy.loc[i - 1, 'new_y2'] - df_y_copy.loc[i - 1, 'new_y']
+                        else:
+                            df_y_copy.loc[i - 1, 'h'] = df_y_copy.loc[i - 1, 'y2'] - df_y_copy.loc[i - 1, 'new_y']
+                    else:
+                        if df_y_copy.loc[i - 1, 'new_y2'] > 0:
+                            df_y_copy.loc[i - 1, 'h'] = df_y_copy.loc[i - 1, 'new_y2'] - df_y_copy.loc[i - 1, 'y']
 
         #  copy of input data frame to mak required changes
         df_copy = df.copy()
@@ -2805,6 +2988,7 @@ class PyMuPdf:
                 img = np.array(img)
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
                 img = np.where(img > 200, 255, 0)
+                # cv2.imwrite(self.result_dir + str(page_num) + '_.jpeg', img)
                 index_five = dataframe.index[0:5].tolist()
                 # cropping for 5 index to check if coordinates need to be rotated or not
                 for i in index_five:
@@ -2819,7 +3003,7 @@ class PyMuPdf:
                         toRotateList.append(True)
                     else:
                         toRotateList.append(False)
-                if toRotateList.count(True) > 2:
+                if (toRotateList.count(True) > 2) or (max(dataframe['y1']) > page_height):
                     toRotate = True
                 if toRotate:
                     print('Rotating the pixel values')
@@ -2879,6 +3063,9 @@ class PyMuPdf:
             dataframe = self.metadata_correcction_y_coordnates(dataframe)
             # correcting meta information of overlapping y2 -y coordinates
             dataframe = self.medatdata_y2_values_correction(dataframe)
+
+            dataframe.drop(dataframe[dataframe['text']=='.'].index, inplace=True)
+            dataframe.reset_index(drop=True, inplace=True)
             self.df_raw = dataframe.copy()
 
             # ---------------------------------- DEEP LEARNING MODEL FOR DETECTION ---------------------------------
@@ -2961,8 +3148,14 @@ class PyMuPdf:
                 indexNames = dataframe[(dataframe['block_n'] == -1)].index
                 dataframe.drop(indexNames, inplace=True)
 
+                # unicodes removal
+                for c in dataframe.columns:
+                    dataframe[c] = dataframe[c].apply(lambda x: str(x).replace(u'\u00a0', u' '))
+                    dataframe[c] = dataframe[c].apply(lambda x: str(x).replace(u'\xa0', u' '))
+                    dataframe[c] = dataframe[c].apply(lambda x: str(x).replace('None', u''))
+
                 # STEP 4.a : Handling Multilines detected by model
-                orig_dataframe, dataframe = self.identify_cell_ids_with_multiline(src=dataframe)
+                orig_dataframe, dataframe, self.lookup_detections_df = self.identify_cell_ids_with_multiline(src=dataframe, lookupdet=self.lookup_detections_df )
                 # STEP 4.b : Handling Multiline part2
                 # since multiline is handled now using 'identify_overlap_of_det_along_y_axis' func above
                 # we will not run the below code to reidentify missed multilines
@@ -3049,6 +3242,12 @@ class PyMuPdf:
             # calling the function where detection and processing takes place ---------------------------------
             pixel_dic, dataframe, excel_data, raw_df, dbstatus = self.pdf_to_page_df_mypypdf_intrim(page_num=page_no, result_save=result_save)
 
+            temp = dataframe.to_json(orient="split")
+            jtemp = json.dumps(temp)
+            fi = open(self.result_dir + str(page_no) + '_page'  "_data.json", "w")
+            fi.write(jtemp)
+            fi.close()
+
             page_info.update({str(page_no): pixel_dic})
             final_df = final_df.append(dataframe, ignore_index=True)
             excel_df = excel_df.append(excel_data, ignore_index=True)
@@ -3066,7 +3265,7 @@ class PyMuPdf:
             num_records = list(cursor)
             num_records = num_records[0][0]
             if num_records > 0:
-                statement = "UPDATE documentspypages SET status='{}' where documentid={} and pageno={}".format(str(self.db_status), str(self.source), page_no)
+                statement = "UPDATE documentspypages SET status='{}' where documentid='{}' and pageno={}".format(str(self.db_status), str(self.source), page_no)
                 cursor.execute(statement)
                 cursor.commit()
             else:
@@ -3084,6 +3283,9 @@ class PyMuPdf:
 
         statement = "UPDATE documentspy SET exception='{}' where documentid={}".format('ML_Processed',str(self.source))
         cursor.execute(statement)
+        cursor.commit()
+        statemet = "UPDATE documentspy SET status='{}' where documentid={}".format('ML_ready',str(self.source))
+        cursor.execute(statemet)
         cursor.commit()
         return page_info, final_df, final_df_raw, excel_df, response_json, self.db_status
 
