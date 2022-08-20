@@ -1,0 +1,5 @@
+train: gauge_data/train/images
+val: gauge_data/test/images
+
+nc: 5
+names: ['z','A', 'B', 'C', 'M']
